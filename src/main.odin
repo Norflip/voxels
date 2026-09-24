@@ -51,6 +51,9 @@ main :: proc() {
     gl.DebugMessageCallback(gl_err_callback, nil)
     gl.DebugMessageControl(gl.DONT_CARE, gl.DONT_CARE, gl.DEBUG_SEVERITY_NOTIFICATION, 0, nil, gl.FALSE)
 
+    renderer_init(winwidth, winheight)
+    defer renderer_shutdown()
+
     iml_init()
     world : World
     world_init(&world)
@@ -87,13 +90,12 @@ main :: proc() {
 
         player_tick(&player, f32(dt))
 
-        gl.Viewport(0, 0, winwidth, winheight)
-        gl.ClearColor(0.1, 0.1, 0.2, 1.0)
-        gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+        if renderer_begin_frame() {
+            world_render(&world, player.view_proj, draw_lines = true)
+            iml_render(player.view_proj)
+            renderer_end_frame()
+        }
 
-        world_render(&world, player.view_proj)
-
-        iml_render(player.view_proj)
         glfw.SwapBuffers(window)
     }
 }

@@ -1,6 +1,7 @@
 package main
 import "base:runtime"
 import "core:math/rand"
+import "base:intrinsics"
 
 C_SIZE :: 32
 C_SHIFT :: 5
@@ -20,10 +21,10 @@ CARDINAL := [6]ivec3 {
 }
 
 Chunk_Face :: struct {
-    loc :   u32,
-    tex :   u32,
-    _pad0 : u32,
-    _pad1 : u32,
+    loc :  u32,
+    tex :  u32,
+    ao :   u32,
+    _pad : u32,
 }
 
 Chunk :: struct {
@@ -41,7 +42,10 @@ chunk_init :: proc(c : ^Chunk, pos : [3]i32, allocator : runtime.Allocator = con
     c.block_allocator = allocator
     c.num_filled = 0
     c.dirty = true
-    c.handle = Mesh_Handle{offset = 0, count = 0}
+    c.handle = Mesh_Handle {
+        offset = 0,
+        count  = 0,
+    }
 }
 
 chunk_destroy :: proc(c : ^Chunk) {
@@ -58,9 +62,7 @@ chunk_set_block :: proc(chunk : ^Chunk, x, y, z : i32, block : u8) -> bool {
     if chunk.blocks == nil {
         if block == 0 do return false
         chunk.blocks = make([^]u8, C_VOL_PAD, chunk.block_allocator)
-        if chunk.blocks == nil {
-            panic("failed to allocate memory for chunk blocks")
-        }
+        if chunk.blocks == nil do panic("failed to allocate memory for chunk blocks")
         chunk.num_filled = 0
     }
 
@@ -87,8 +89,13 @@ chunk_get_block :: proc(chunk : ^Chunk, x, y, z : i32) -> u8 {
     return chunk.blocks[index]
 }
 
+@(require_results)
+chunk_mark_mesh_dirty :: proc "contextless" (chunk : ^Chunk) -> bool {
+    return !bool(intrinsics.atomic_exchange(&chunk.dirty, true))
+}
+
 chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
-    if chunk.num_filled == 0 || !chunk.dirty do return 0
+    if chunk.num_filled == 0 do return 0
     count : u32 = 0
 
     for z in 0 ..< i32(C_SIZE) {
@@ -99,8 +106,9 @@ chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
                 if block == 0 do continue
                 for face in 0 ..< 6 {
                     npos := pos + CARDINAL[face]
-                    if !block_is_solid(chunk, npos.x, npos.y, npos.z) {
-                        faces_out[count] = make_face(pos, face, 0)
+                    if !is_solid(chunk, npos) {
+                        ao := get_face_ao_packed(chunk, pos.x, pos.y, pos.z, face)
+                        faces_out[count] = make_face(pos, face, u32(block - 1), ao)
                         count += 1
                     }
                 }
@@ -110,6 +118,46 @@ chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
 
     chunk.dirty = false
     return count
+}
+
+
+@(private = "file")
+get_face_ao_packed :: proc(chunk: ^Chunk, x, y, z: i32, face: int) -> u32 {
+    @(rodata)
+    @(static)
+    g_face_uv := [6][2]ivec3 {
+        {{0, 0, 1}, {0, 1, 0}},  // +X
+        {{0, 0, -1}, {0, 1, 0}}, // -X
+        {{1, 0, 0}, {0, 0, 1}},  // +Y
+        {{0, 0, 1}, {1, 0, 0}},  // -Y
+        {{-1, 0, 0}, {0, 1, 0}}, // +Z
+        {{1, 0, 0}, {0, 1, 0}},  // -Z
+    }
+
+    ao_value :: proc(side1, side2, corner: bool) -> u32 {
+        if side1 && side2 do return 0
+        return 3 - u32(u8(side1) + u8(side2) + u8(corner))
+    }
+
+    s := ivec3{x, y, z} + CARDINAL[face]
+    u := g_face_uv[face][0]
+    v := g_face_uv[face][1]
+
+    u_neg := is_solid(chunk, s - u)
+    u_pos := is_solid(chunk, s + u)
+    v_neg := is_solid(chunk, s - v)
+    v_pos := is_solid(chunk, s + v)
+    
+    ao := [4]u32 {
+        ao_value(u_neg, v_neg, is_solid(chunk, s - u - v)),
+        ao_value(u_pos, v_neg, is_solid(chunk, s + u - v)),
+        ao_value(u_pos, v_pos, is_solid(chunk, s + u + v)),
+        ao_value(u_neg, v_pos, is_solid(chunk, s - u + v)),
+    }
+
+    packed_ao := ao[0] | ao[1] << 2 | ao[2] << 4 | ao[3] << 6
+    if ao[1] + ao[3] < ao[0] + ao[2] do packed_ao |= 1 << 8
+    return packed_ao
 }
 
 @(private = "file")
@@ -128,13 +176,13 @@ in_inner_bounds :: #force_inline proc(x, y, z : i32) -> bool {
 }
 
 @(private = "file")
-block_is_solid :: proc(chunk : ^Chunk, x, y, z : i32) -> bool {
-    return chunk_get_block(chunk, x, y, z) != 0
+is_solid :: #force_inline proc(chunk : ^Chunk, pos : ivec3) -> bool {
+    return chunk_get_block(chunk, pos.x, pos.y, pos.z) != 0
 }
 
 @(private = "file")
-make_face :: proc(pos : ivec3, #any_int face : u32, tex : u32) -> Chunk_Face {
+make_face :: proc(pos : ivec3, #any_int face : u32, tex : u32, ao : u32) -> Chunk_Face {
     x, y, z : u32 = u32(pos.x) & 0x1F, u32(pos.y) & 0x1F, u32(pos.z) & 0x1F
     loc := (x & 0x1F) | ((y & 0x1F) << 5) | ((z & 0x1F) << 10) | ((face & 0x7) << 15)
-    return Chunk_Face{loc = loc, tex = tex, _pad0 = 0, _pad1 = 0}
+    return Chunk_Face{loc = loc, tex = tex, ao = ao, _pad = 0}
 }

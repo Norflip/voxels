@@ -8,10 +8,7 @@ MAX_LINE_VERTICES :: MAX_LINES * 2
 
 @(rodata)
 @(private = "file")
-BOX_CORNERS := [8]vec3 {
-    {-0.5, -0.5, -0.5}, {0.5, -0.5, -0.5}, {0.5, -0.5, 0.5}, {-0.5, -0.5, 0.5},
-    {-0.5,  0.5, -0.5}, {0.5,  0.5, -0.5}, {0.5,  0.5, 0.5}, {-0.5,  0.5, 0.5},
-}
+BOX_CORNERS := [8]vec3{{-0.5, -0.5, -0.5}, {0.5, -0.5, -0.5}, {0.5, -0.5, 0.5}, {-0.5, -0.5, 0.5}, {-0.5, 0.5, -0.5}, {0.5, 0.5, -0.5}, {0.5, 0.5, 0.5}, {-0.5, 0.5, 0.5}}
 
 @(private = "file")
 Line_Vertex :: struct {
@@ -23,10 +20,9 @@ Line_Vertex :: struct {
 @(private = "file")
 _ctx : struct {
     program :     u32,
-    vao :         u32, 
     vbo :         u32,
     vp_loc :      i32,
-    count :       i32, 
+    count :       i32,
     initialized : bool,
 }
 
@@ -40,12 +36,10 @@ iml_init :: proc() -> bool {
         return false
     }
 
-    gl.CreateVertexArrays(1, &_ctx.vao)
     gl.CreateBuffers(1, &_ctx.vbo)
     gl.NamedBufferStorage(_ctx.vbo, size_of(_vertices), nil, gl.DYNAMIC_STORAGE_BIT)
 
     when ODIN_DEBUG {
-        gl.ObjectLabel(gl.VERTEX_ARRAY, _ctx.vao, -1, "debug_line_vao")
         gl.ObjectLabel(gl.BUFFER, _ctx.vbo, -1, "debug_line_buffer")
     }
 
@@ -59,12 +53,12 @@ iml_init :: proc() -> bool {
 iml_cleanup :: proc() {
     if !_ctx.initialized do return
     gl.DeleteBuffers(1, &_ctx.vbo)
-    gl.DeleteVertexArrays(1, &_ctx.vao)
     gl.DeleteProgram(_ctx.program)
     _ctx = {}
 }
 
 iml_render :: proc(vp : mat4) {
+    renderer_group("iml_render")
     if !_ctx.initialized || _ctx.count == 0 do return
 
     vertex_count := _ctx.count * 2
@@ -73,7 +67,7 @@ iml_render :: proc(vp : mat4) {
     gl.UseProgram(_ctx.program)
     vp := vp
     gl.UniformMatrix4fv(_ctx.vp_loc, 1, gl.FALSE, raw_data(&vp))
-    gl.BindVertexArray(_ctx.vao)
+    renderer_bind_empty_vao()
     gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, _ctx.vbo)
 
     gl.Enable(gl.DEPTH_TEST)
@@ -84,6 +78,7 @@ iml_render :: proc(vp : mat4) {
     gl.DrawArrays(gl.LINES, 0, vertex_count)
 
     gl.Disable(gl.BLEND)
+
     _ctx.count = 0
 }
 
