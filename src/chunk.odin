@@ -3,6 +3,17 @@ import "base:runtime"
 import "core:math/rand"
 import "base:intrinsics"
 
+Block :: enum u8 {
+    Air = 0,
+    Stone,
+    Mantle,
+    Dirt,
+}
+
+block_is_solid :: #force_inline proc(b : Block) -> bool {
+    return b != Block.Air
+}
+
 C_SIZE :: 32
 C_SHIFT :: 5
 
@@ -29,7 +40,7 @@ Chunk_Face :: struct {
 
 Chunk :: struct {
     pos :             [3]i32,
-    blocks :          [^]u8,
+    blocks :          [^]Block,
     block_allocator : runtime.Allocator,
     num_filled :      u32,
     dirty :           b32,
@@ -56,12 +67,12 @@ chunk_destroy :: proc(c : ^Chunk) {
     c.num_filled = 0
 }
 
-chunk_set_block :: proc(chunk : ^Chunk, x, y, z : i32, block : u8) -> bool {
+chunk_set_block :: proc(chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
     if !in_padded_bounds(x, y, z) do return false
 
     if chunk.blocks == nil {
-        if block == 0 do return false
-        chunk.blocks = make([^]u8, C_VOL_PAD, chunk.block_allocator)
+        if block == .Air do return false
+        chunk.blocks = make([^]Block, C_VOL_PAD, chunk.block_allocator)
         if chunk.blocks == nil do panic("failed to allocate memory for chunk blocks")
         chunk.num_filled = 0
     }
@@ -71,9 +82,9 @@ chunk_set_block :: proc(chunk : ^Chunk, x, y, z : i32, block : u8) -> bool {
     if old_block == block do return false
 
     if in_inner_bounds(x, y, z) {
-        if old_block != 0 && block == 0 {
+        if old_block != .Air && block == .Air {
             chunk.num_filled -= 1
-        } else if old_block == 0 && block != 0 {
+        } else if old_block == .Air && block != .Air {
             chunk.num_filled += 1
         }
     }
@@ -82,9 +93,9 @@ chunk_set_block :: proc(chunk : ^Chunk, x, y, z : i32, block : u8) -> bool {
     return true
 }
 
-chunk_get_block :: proc(chunk : ^Chunk, x, y, z : i32) -> u8 {
-    if chunk.blocks == nil do return 0
-    if !in_padded_bounds(x, y, z) do return 0
+chunk_get_block :: proc(chunk : ^Chunk, x, y, z : i32) -> Block {
+    if chunk.blocks == nil do return .Air
+    if !in_padded_bounds(x, y, z) do return .Air
     index := index_pos(x, y, z)
     return chunk.blocks[index]
 }
@@ -92,6 +103,10 @@ chunk_get_block :: proc(chunk : ^Chunk, x, y, z : i32) -> u8 {
 @(require_results)
 chunk_mark_mesh_dirty :: proc "contextless" (chunk : ^Chunk) -> bool {
     return !bool(intrinsics.atomic_exchange(&chunk.dirty, true))
+}
+
+chunk_clear_mesh_dirty :: proc "contextless" (chunk : ^Chunk) {
+    intrinsics.atomic_store(&chunk.dirty, false)
 }
 
 chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
@@ -103,12 +118,12 @@ chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
             for x in 0 ..< i32(C_SIZE) {
                 pos := ivec3{x, y, z}
                 block := chunk_get_block(chunk, pos.x, pos.y, pos.z)
-                if block == 0 do continue
+                if block == .Air do continue
                 for face in 0 ..< 6 {
                     npos := pos + CARDINAL[face]
                     if !is_solid(chunk, npos) {
                         ao := get_face_ao_packed(chunk, pos.x, pos.y, pos.z, face)
-                        faces_out[count] = make_face(pos, face, u32(block - 1), ao)
+                        faces_out[count] = make_face(pos, face, u32(block) - 1, ao)
                         count += 1
                     }
                 }
@@ -122,19 +137,19 @@ chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
 
 
 @(private = "file")
-get_face_ao_packed :: proc(chunk: ^Chunk, x, y, z: i32, face: int) -> u32 {
+get_face_ao_packed :: proc(chunk : ^Chunk, x, y, z : i32, face : int) -> u32 {
     @(rodata)
     @(static)
     g_face_uv := [6][2]ivec3 {
-        {{0, 0, 1}, {0, 1, 0}},  // +X
+        {{0, 0, 1}, {0, 1, 0}}, // +X
         {{0, 0, -1}, {0, 1, 0}}, // -X
-        {{1, 0, 0}, {0, 0, 1}},  // +Y
-        {{0, 0, 1}, {1, 0, 0}},  // -Y
+        {{1, 0, 0}, {0, 0, 1}}, // +Y
+        {{0, 0, 1}, {1, 0, 0}}, // -Y
         {{-1, 0, 0}, {0, 1, 0}}, // +Z
-        {{1, 0, 0}, {0, 1, 0}},  // -Z
+        {{1, 0, 0}, {0, 1, 0}}, // -Z
     }
 
-    ao_value :: proc(side1, side2, corner: bool) -> u32 {
+    ao_value :: proc(side1, side2, corner : bool) -> u32 {
         if side1 && side2 do return 0
         return 3 - u32(u8(side1) + u8(side2) + u8(corner))
     }
@@ -147,13 +162,8 @@ get_face_ao_packed :: proc(chunk: ^Chunk, x, y, z: i32, face: int) -> u32 {
     u_pos := is_solid(chunk, s + u)
     v_neg := is_solid(chunk, s - v)
     v_pos := is_solid(chunk, s + v)
-    
-    ao := [4]u32 {
-        ao_value(u_neg, v_neg, is_solid(chunk, s - u - v)),
-        ao_value(u_pos, v_neg, is_solid(chunk, s + u - v)),
-        ao_value(u_pos, v_pos, is_solid(chunk, s + u + v)),
-        ao_value(u_neg, v_pos, is_solid(chunk, s - u + v)),
-    }
+
+    ao := [4]u32{ao_value(u_neg, v_neg, is_solid(chunk, s - u - v)), ao_value(u_pos, v_neg, is_solid(chunk, s + u - v)), ao_value(u_pos, v_pos, is_solid(chunk, s + u + v)), ao_value(u_neg, v_pos, is_solid(chunk, s - u + v))}
 
     packed_ao := ao[0] | ao[1] << 2 | ao[2] << 4 | ao[3] << 6
     if ao[1] + ao[3] < ao[0] + ao[2] do packed_ao |= 1 << 8
@@ -177,7 +187,7 @@ in_inner_bounds :: #force_inline proc(x, y, z : i32) -> bool {
 
 @(private = "file")
 is_solid :: #force_inline proc(chunk : ^Chunk, pos : ivec3) -> bool {
-    return chunk_get_block(chunk, pos.x, pos.y, pos.z) != 0
+    return block_is_solid(chunk_get_block(chunk, pos.x, pos.y, pos.z))
 }
 
 @(private = "file")

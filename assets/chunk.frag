@@ -11,10 +11,11 @@ const vec3 NORMAL_LOOKUP[6] = {
     vec3( 0,  0,  1),
     vec3( 0,  0, -1)
 };
+
 const vec4 BLOCK_TEST_COLORS[] = {
-    vec4(0.8, 0.8, 0.8, 1.0),
-    vec4(0.5, 0.5, 0.5, 1.0),
-    vec4(0.8, 0.0, 0.0, 1.0),
+    vec4(0.6, 0.6, 0.6, 1.0), // stone
+    vec4(0.35, 0.35, 0.35, 1.0), // mantle
+    vec4(0.671, 0.49, 0.18, 1.0), // dirt
 };
 
 const float dir_shadow_strength = 0.3;

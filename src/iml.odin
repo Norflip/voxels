@@ -38,10 +38,7 @@ iml_init :: proc() -> bool {
 
     gl.CreateBuffers(1, &_ctx.vbo)
     gl.NamedBufferStorage(_ctx.vbo, size_of(_vertices), nil, gl.DYNAMIC_STORAGE_BIT)
-
-    when ODIN_DEBUG {
-        gl.ObjectLabel(gl.BUFFER, _ctx.vbo, -1, "debug_line_buffer")
-    }
+    when ODIN_DEBUG do gl.ObjectLabel(gl.BUFFER, _ctx.vbo, -1, "debug_line_buffer")
 
     _ctx.program = program
     _ctx.vp_loc = gl.GetUniformLocation(program, "u_vp")
@@ -60,13 +57,14 @@ iml_cleanup :: proc() {
 iml_render :: proc(vp : mat4) {
     renderer_group("iml_render")
     if !_ctx.initialized || _ctx.count == 0 do return
+    vp := vp
 
     vertex_count := _ctx.count * 2
     gl.NamedBufferSubData(_ctx.vbo, 0, int(vertex_count) * size_of(Line_Vertex), &_vertices[0])
 
     gl.UseProgram(_ctx.program)
-    vp := vp
     gl.UniformMatrix4fv(_ctx.vp_loc, 1, gl.FALSE, raw_data(&vp))
+
     renderer_bind_empty_vao()
     gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, _ctx.vbo)
 
@@ -76,9 +74,7 @@ iml_render :: proc(vp : mat4) {
     gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
     gl.DrawArrays(gl.LINES, 0, vertex_count)
-
     gl.Disable(gl.BLEND)
-
     _ctx.count = 0
 }
 

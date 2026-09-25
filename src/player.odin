@@ -1,7 +1,8 @@
 package main
 
-import m "core:math/linalg/glsl"
+import "core:fmt"
 import "vendor:glfw"
+import m "core:math/linalg/glsl"
 
 NEAR_Z :: 0.1
 FAR_Z :: 1000.0
@@ -9,13 +10,13 @@ FOV :: 90.0
 MAX_PITCH :: 89.9
 MOUSE_SENSITIVITY :: 0.05
 
-WORLD_UP :: m.vec3{0, 1, 0}
-LOCAL_FORWARD :: m.vec3{0, 0, -1}
-LOCAL_RIGHT :: m.vec3{1, 0, 0}
+WORLD_UP :: vec3{0, 1, 0}
+LOCAL_FORWARD :: vec3{0, 0, -1}
+LOCAL_RIGHT :: vec3{1, 0, 0}
 
 Player :: struct {
-    pos :            m.vec3,
-    yaw, pitch :     f32, 
+    pos :            vec3,
+    yaw, pitch :     f32,
     orientation :    m.quat,
     speed :          f32,
     dirty :          bool,
@@ -28,7 +29,7 @@ Player :: struct {
     last_x, last_y : f64,
 }
 
-player_init :: proc(p : ^Player, pos : m.vec3, window : glfw.WindowHandle) {
+player_init :: proc(p : ^Player, pos : vec3, window : glfw.WindowHandle) {
     p.pos = pos
     p.yaw = 0
     p.pitch = 0
@@ -46,7 +47,7 @@ player_init :: proc(p : ^Player, pos : m.vec3, window : glfw.WindowHandle) {
     p.dirty = true
 }
 
-player_tick :: proc(p : ^Player, delta_time : f32) {
+player_tick :: proc(p : ^Player, world : ^World, delta_time : f32) {
     update_input(p, delta_time)
 
     if p.dirty {
@@ -62,12 +63,27 @@ player_tick :: proc(p : ^Player, delta_time : f32) {
     p.view_proj = p.proj * p.view
 }
 
-player_forward :: proc(p : ^Player) -> m.vec3 {
+player_forward :: proc(p : Player) -> vec3 {
     return m.quatMulVec3(p.orientation, LOCAL_FORWARD)
 }
 
-player_right :: proc(p : ^Player) -> m.vec3 {
+player_right :: proc(p : Player) -> vec3 {
     return m.quatMulVec3(p.orientation, LOCAL_RIGHT)
+}
+
+player_get_ray :: proc(p : Player, x, y : f64) -> (origin, dir : vec3, ok : bool) {
+    width, height := glfw.GetWindowSize(p.window)
+    if width <= 0 || height <= 0 do return origin, dir, false
+
+    ndc_x := 2.0 * f32(x) / f32(width) - 1.0
+    ndc_y := 1.0 - 2.0 * f32(y) / f32(height)
+
+    near_view := m.inverse(p.proj) * vec4{ndc_x, ndc_y, -1.0, 1.0}
+    near_view /= near_view.w
+
+    dir = m.normalize(m.quatMulVec3(p.orientation, near_view.xyz))
+    origin = p.pos
+    return origin, dir, true
 }
 
 @(private = "file")
@@ -117,8 +133,8 @@ update_input :: proc(p : ^Player, dt : f32) {
 
     speed := glfw.GetKey(p.window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS ? p.speed * 5 : p.speed
     if xt != 0 || yt != 0 || zt != 0 {
-        dir := m.normalize(m.vec3{xt, yt, zt})
-        move_dir := player_right(p) * dir.x + WORLD_UP * dir.y + player_forward(p) * dir.z
+        dir := m.normalize(vec3{xt, yt, zt})
+        move_dir := player_right(p^) * dir.x + WORLD_UP * dir.y + player_forward(p^) * dir.z
         p.pos += move_dir * speed * dt
         p.dirty = true
     }

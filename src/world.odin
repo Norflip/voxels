@@ -5,12 +5,18 @@ import "core:math/rand"
 import "core:mem"
 import "core:sync"
 import gl "vendor:OpenGL"
+import "core:math/noise"
 
 COL_HEIGHT :: 16
 MAX_FACES :: C_VOLUME * 3 // * 3 for opaque, * 6 if transparent?
 RENDER_CAP :: 4096
 
 NEIGHBOUR_DIRS :: [4]ivec2{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
+
+Column_Heights :: [C_SIZE][C_SIZE]i32
+BASE_HEIGHT :: 34
+HEIGHT_AMPLITUDE :: 16
+NOISE_FREQ :: 1.0 / 128.0
 
 @(private = "file")
 Per_Chunk_Data :: struct {
@@ -106,7 +112,7 @@ load_init_chunks :: proc(w : ^World) {
     }
 }
 
-world_set_block :: proc(w : ^World, pos : ivec3, block : u8) -> bool {
+world_set_block :: proc(w : ^World, pos : ivec3, block : Block) -> bool {
     sync.rw_mutex_shared_guard(&w.chunks_mu)
     chunk_pos, local_pos := loc_world_chunk_local(pos)
     chunk := get_chunk_unsafe(w, chunk_pos)
@@ -114,15 +120,15 @@ world_set_block :: proc(w : ^World, pos : ivec3, block : u8) -> bool {
     return set_block_internal(w, chunk, local_pos.x, local_pos.y, local_pos.z, block)
 }
 
-world_get_block :: proc(w : ^World, pos : ivec3) -> u8 {
+world_get_block :: proc(w : ^World, pos : ivec3) -> Block {
     sync.rw_mutex_shared_guard(&w.chunks_mu)
     chunk_pos, local_pos := loc_world_chunk_local(pos)
     chunk := get_chunk_unsafe(w, chunk_pos)
-    if chunk == nil do return 0
+    if chunk == nil do return .Air
     return chunk_get_block(chunk, local_pos.x, local_pos.y, local_pos.z)
 }
 
-world_set_chunk_block :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : u8) -> bool {
+world_set_chunk_block :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
     if chunk == nil do return false
     sync.rw_mutex_shared_guard(&w.chunks_mu)
     return set_block_internal(w, chunk, x, y, z, block)
@@ -146,7 +152,7 @@ world_render :: proc(w : ^World, vp : mat4, draw_lines : bool = false) {
             vertex_pool_free(&w.vertex_pool, result.handle)
             continue
         }
-        vertex_pool_publish(&w.vertex_pool, result.handle)
+        if result.handle.count > 0 do vertex_pool_publish(&w.vertex_pool, result.handle)
         vertex_pool_free(&w.vertex_pool, chunk.handle)
         chunk.handle = result.handle
     }
@@ -208,7 +214,7 @@ push_chunk :: proc(w : ^World, chunk : ^Chunk) -> bool {
 }
 
 @(private = "file")
-set_block_internal :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : u8) -> bool {
+set_block_internal :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
     if chunk == nil do return false
 
     did_set := chunk_set_block(chunk, x, y, z, block)
@@ -255,9 +261,10 @@ set_block_internal :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : u8
 
 @(private = "file")
 mark_chunk_dirty :: proc(w : ^World, chunk : ^Chunk) {
-    if chunk_mark_mesh_dirty(chunk) do return
-    //sync.mutex_guard(&w.dirty_mu)
-    //append(&w.dirty_chunks, chunk.pos) // maybe something like this?
+    if !chunk_mark_mesh_dirty(chunk) do return
+
+    // either push directly or add to a dirty queue?
+    worker_push(&w.mesh_thread, chunk.pos)
 }
 
 @(private = "file")
@@ -274,32 +281,24 @@ get_chunk_unsafe :: proc(world : ^World, pos : ivec3) -> ^Chunk {
     }
     return nil
 }
+
 @(private = "file")
 gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     world := cast(^World)user_data
-    gen := rand.xoshiro256_random_generator()
-    world_height := 50
-    max_gen := (world_height / C_SIZE) + 1
 
-    for i := max_gen - 1; i >= 0; i -= 1 {
-        pos := ivec3{loc.x, i32(i), loc.y}
-        chunk := get_chunk(world, pos)
-        if chunk == nil do break
+    column : [COL_HEIGHT]^Chunk
+    for i in 0 ..< COL_HEIGHT do column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
 
-        for y in 0 ..< C_SIZE {
-            if y + int(chunk.pos.y * C_SIZE) >= world_height do break
+    heights : Column_Heights
+    max_height := gen_heights(loc, &heights)
+    top_chunk := (max_height - 1) >> C_SHIFT
 
-            for x in 0 ..< C_SIZE {
-                for z in 0 ..< C_SIZE {
-                    block := u8(rand.uint64(gen) % 4)
-
-                    if block == 2 do block = 1
-                    if i == 0 && y == 0 do block = 2
-                    world_set_chunk_block(world, chunk, i32(x), i32(y), i32(z), block)
-                }
-            }
-        }
+    for i in 0 ..= top_chunk do if column[i] != nil {
+        gen_shape(world, column[i], &heights)
     }
+
+    gen_surface(world, &column, &heights)
+    if column[0] != nil do gen_mantle(world, column[0])
 
     ready : [5]ivec2
     ready_count := 0
@@ -321,11 +320,64 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     }
     sync.mutex_unlock(&world.columns_mu)
 
+    // All chunks, including empty ones, so the mesher clears their initial dirty flag.
     for c in ready[:ready_count] {
         for i in 0 ..< COL_HEIGHT {
             pos := ivec3{c.x, i32(i), c.y}
-            chunk := get_chunk(world, pos)
-            if chunk != nil && chunk.num_filled > 0 do worker_push(&world.mesh_thread, pos)
+            if get_chunk(world, pos) != nil do worker_push(&world.mesh_thread, pos)
+        }
+    }
+}
+
+@(private = "file")
+gen_heights :: proc(loc : ivec2, heights : ^Column_Heights) -> (max_height : i32) {
+
+    for x in 0 ..< i32(C_SIZE) {
+        for z in 0 ..< i32(C_SIZE) {
+            wx := f64(loc.x * C_SIZE + x)
+            wz := f64(loc.y * C_SIZE + z)
+            n := noise.noise_2d(0, {wx * NOISE_FREQ, wz * NOISE_FREQ})
+            h := clamp(BASE_HEIGHT + i32(n * HEIGHT_AMPLITUDE), 1, COL_HEIGHT * C_SIZE)
+            heights[x][z] = h
+            max_height = max(max_height, h)
+        }
+    }
+    return
+}
+
+@(private = "file")
+gen_shape :: proc(w : ^World, chunk : ^Chunk, heights : ^Column_Heights) {
+    base_y := chunk.pos.y * C_SIZE
+    for x in 0 ..< i32(C_SIZE) {
+        for z in 0 ..< i32(C_SIZE) {
+            top := min(heights[x][z] - base_y, C_SIZE)
+            for y in 0 ..< top {
+                world_set_chunk_block(w, chunk, x, y, z, .Stone)
+            }
+        }
+    }
+}
+
+@(private = "file")
+gen_surface :: proc(w : ^World, column : ^[COL_HEIGHT]^Chunk, heights : ^Column_Heights) {
+    for x in 0 ..< i32(C_SIZE) {
+        for z in 0 ..< i32(C_SIZE) {
+            top := heights[x][z] - 1
+            if top < 0 do break
+
+            chunk := column[top >> C_SHIFT]
+            if chunk == nil do continue
+            world_set_chunk_block(w, chunk, x, top & (C_SIZE - 1), z, .Dirt)
+        }
+    }
+}
+
+@(private = "file")
+gen_mantle :: proc(w : ^World, bottom : ^Chunk) {
+    assert(bottom.pos.y == 0)
+    for x in 0 ..< i32(C_SIZE) {
+        for z in 0 ..< i32(C_SIZE) {
+            world_set_chunk_block(w, bottom, x, 0, z, .Mantle)
         }
     }
 }
@@ -349,18 +401,25 @@ mesh_thread_proc :: proc(loc : ivec3, scratch : mem.Allocator, user_data : rawpt
     chunk := get_chunk_unsafe(world, loc)
     if chunk == nil do return
 
-    bytes, err := mem.alloc_bytes_non_zeroed(MAX_FACES * size_of(Chunk_Face), align_of(Chunk_Face), scratch)
-    assert(err == nil, "mesh scratch arena too small")
-    face_buffer := mem.slice_data_cast([]Chunk_Face, bytes)
-    face_count := u32(chunk_generate_faces(chunk, face_buffer))
+    // Must precede all block reads: any edit after this point re-queues the chunk.
+    chunk_clear_mesh_dirty(chunk)
 
-    handle, ok := vertex_pool_alloc(&world.vertex_pool, face_buffer[:face_count])
-    if !ok {
-        fmt.eprintfln("vertex pool allocation failed for chunk %v", loc)
-        return
+    handle : Mesh_Handle
+    if chunk.num_filled > 0 {
+        bytes, err := mem.alloc_bytes_non_zeroed(MAX_FACES * size_of(Chunk_Face), align_of(Chunk_Face), scratch)
+        assert(err == nil, "mesh scratch arena too small")
+        face_buffer := mem.slice_data_cast([]Chunk_Face, bytes)
+        face_count := u32(chunk_generate_faces(chunk, face_buffer))
+
+        if face_count > 0 {
+            ok : bool
+            handle, ok = vertex_pool_alloc(&world.vertex_pool, face_buffer[:face_count])
+            if !ok {
+                fmt.eprintfln("vertex pool allocation failed for chunk %v", loc)
+                return
+            }
+        }
     }
-
-//    fmt.eprintfln("vertex pool page count: %v / %v", world.vertex_pool.page_count - world.vertex_pool.free_pages, world.vertex_pool.page_count)
 
     sync.mutex_lock(&world.mesh_results_mu)
     queue.push_back(&world.mesh_results, Mesh_Result{loc, handle})
