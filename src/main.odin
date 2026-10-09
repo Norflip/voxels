@@ -64,14 +64,18 @@ main :: proc() {
 
     world : World
     world_init(&world)
+    //defer world_shutdown(&world)
 
     player : Player
-    player_init(&player, vec3{0, 0, 3}, window)
+    player_init(&player, vec3{C_SIZE / 2, BASE_HEIGHT + HEIGHT_AMPLITUDE, C_SIZE / 2}, window)
 
     fps_frames := 0
     fps_elapsed := 0.0
     fps_worst_dt := 0.0
     t1 := glfw.GetTime()
+
+    fps : f64 = 0.0
+    avg_ms : f64 = 0.0
 
     for glfw.WindowShouldClose(window) == false {
         free_all(context.temp_allocator)
@@ -87,11 +91,8 @@ main :: proc() {
         fps_elapsed += dt
         fps_worst_dt = max(fps_worst_dt, dt)
         if fps_elapsed >= 0.5 {
-            fps := f64(fps_frames) / fps_elapsed
-            avg_ms := fps_elapsed * 1000 / f64(fps_frames)
-            title := fmt.ctprintf("%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
-            glfw.SetWindowTitle(window, title)
-
+            fps = f64(fps_frames) / fps_elapsed
+            avg_ms = fps_elapsed * 1000 / f64(fps_frames)
             fps_frames = 0
             fps_elapsed = 0
             fps_worst_dt = 0
@@ -100,8 +101,22 @@ main :: proc() {
         player_tick(&player, &world, f32(dt))
         block_interaction(player, &world)
 
+        text(10, 10, "voxels")
+        //text(10, 30, "fps: %.2f", fps_elapsed > 0 ? f64(fps_frames) / fps_elapsed : 0)
+        text(10, 30, "%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
+        text(
+            10,
+            50,
+            "vertex pool utilization: %d / %d %.2f%%",
+            world.vertex_pool.page_count - world.vertex_pool.free_pages,
+            world.vertex_pool.page_count,
+            f32(world.vertex_pool.page_count - world.vertex_pool.free_pages) / f32(world.vertex_pool.page_count) * 100,
+        )
+
         if renderer_begin_frame() {
-            world_render(&world, player.view_proj, draw_lines = true)
+            face_count := world_render(&world, player.view_proj, draw_lines = true)
+            text(10, 70, "face count: %d", face_count)
+
             iml_render(player.view_proj)
             renderer_end_frame()
         }

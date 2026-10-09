@@ -18,6 +18,8 @@ BASE_HEIGHT :: 34
 HEIGHT_AMPLITUDE :: 16
 NOISE_FREQ :: 1.0 / 128.0
 
+
+
 @(private = "file")
 Per_Chunk_Data :: struct {
     x, y, z :  i32,
@@ -93,8 +95,8 @@ world_init :: proc(w : ^World) {
 load_init_chunks :: proc(w : ^World) {
     sync.rw_mutex_guard(&w.chunks_mu)
     sync.mutex_guard(&w.columns_mu)
-    for x := 0; x <= 1; x += 1 {
-        for z := 0; z <= 1; z += 1 {
+    for x := 0; x <= 6; x += 1 {
+        for z := 0; z <= 6; z += 1 {
             col := ivec2{i32(x), i32(z)}
             if _, ok := w.columns[col]; ok {
                 continue
@@ -141,7 +143,7 @@ loc_world_chunk_local :: proc(pos : ivec3) -> (chunk, local : ivec3) {
     return
 }
 
-world_render :: proc(w : ^World, vp : mat4, draw_lines : bool = false) {
+world_render :: proc(w : ^World, vp : mat4, draw_lines : bool = false) -> u32 {
     renderer_group("world_render")
 
     // handle mesh results
@@ -163,20 +165,23 @@ world_render :: proc(w : ^World, vp : mat4, draw_lines : bool = false) {
 
     // collect chunks
     w.render_count = 0
+    face_count : u32 = 0
+
     sync.rw_mutex_shared_lock(&w.chunks_mu)
     for _, chunk in w.chunks {
         push_chunk(w, chunk)
+        face_count += chunk.handle.count
 
-        if draw_lines {
+        if draw_lines && chunk.blocks != nil {
             min_pos := chunk.pos * C_SIZE
             max_pos := min_pos + ivec3{C_SIZE, C_SIZE, C_SIZE}
-            color := u32(chunk.blocks != nil ? 0xFFFFFFFF : 0xFFFFFF1E)
-            iml_bounds(vec3(min_pos), vec3(max_pos), color)
+           // color := u32(chunk.blocks != nil ? 0xFFFFFFFF : 0xFFFFFF1E)
+            iml_bounds(vec3(min_pos), vec3(max_pos), 0xFFFFFF1E)
         }
     }
     sync.rw_mutex_shared_unlock(&w.chunks_mu)
 
-    if w.render_count <= 0 do return
+    if w.render_count <= 0 do return 0
 
     gl.FlushMappedNamedBufferRange(w.cmd_buffer, 0, int(w.render_count) * size_of(gl.DrawArraysIndirectCommand))
     gl.FlushMappedNamedBufferRange(w.data_buffer, 0, int(w.render_count) * size_of(Per_Chunk_Data))
@@ -194,6 +199,8 @@ world_render :: proc(w : ^World, vp : mat4, draw_lines : bool = false) {
     gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 1, w.data_buffer)
     gl.BindBuffer(gl.DRAW_INDIRECT_BUFFER, w.cmd_buffer)
     gl.MultiDrawArraysIndirect(gl.TRIANGLES, nil, i32(w.render_count), 0)
+
+    return face_count
 }
 
 @(private = "file")
@@ -298,8 +305,11 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     }
 
     gen_surface(world, &column, &heights)
-    if column[0] != nil do gen_mantle(world, column[0])
 
+
+
+    if column[0] != nil do gen_mantle(world, column[0])
+    
     ready : [5]ivec2
     ready_count := 0
 
