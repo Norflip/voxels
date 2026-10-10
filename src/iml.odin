@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import gl "vendor:OpenGL"
+import m "core:math/linalg/glsl"
 
 MAX_LINES :: 16 * 1024
 MAX_LINE_VERTICES :: MAX_LINES * 2
@@ -90,10 +91,21 @@ iml_box :: proc(centre, size : vec3, color : u32) {
     if !_ctx.initialized || _ctx.count + 12 > MAX_LINES do return
 
     corners : [8]vec3
-    for i in 0 ..< 8 {
-        corners[i] = centre + BOX_CORNERS[i] * size
-    }
+    for corner, i in BOX_CORNERS do corners[i] = centre + corner * size
+    iml_hull(corners, color)
+}
 
+iml_frustum :: proc(cam : Camera, color : u32) {
+    inv := m.inverse(cam.view_proj)
+    corners : [8]vec3
+    for corner, i in BOX_CORNERS {
+        p := inv * vec4{corner.x * 2, corner.y * 2, corner.z * 2, 1}
+        corners[i] = p.xyz / p.w
+    }
+    iml_hull(corners, color)
+}
+
+iml_hull :: proc(corners : [8]vec3, color : u32) {
     j := 3
     for i in 0 ..< 4 {
         iml_line(corners[i], corners[j], color)

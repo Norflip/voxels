@@ -15,10 +15,26 @@ GL_VERSION_MINOR :: 6
 WINDOW_ASPECT :: f32(6.0 / 5.0)
 WINDOW_MONITOR_FACTOR :: f32(0.75)
 
+
+g_player : Player
+g_is_frozen : bool
+g_frozen_cam : Camera
+
 MOUSE_BUTTON_COUNT :: glfw.MOUSE_BUTTON_LAST + 1
 mouse_pressed : [MOUSE_BUTTON_COUNT]bool
 
+g_tracking_allocator : mem.Tracking_Allocator
+
 main :: proc() {
+    when ODIN_DEBUG {
+        backing := context.allocator
+        mem.tracking_allocator_init(&g_tracking_allocator, backing)
+        context.allocator = mem.tracking_allocator(&g_tracking_allocator)
+        defer {
+            mem.tracking_allocator_destroy(&g_tracking_allocator)
+        }
+    }
+
     glfw.SetErrorCallback(glfw_err_callback)
     if !glfw.Init() {
         fmt.println("Failed to initialize GLFW")
@@ -63,11 +79,10 @@ main :: proc() {
     defer iml_cleanup()
 
     world : World
-    world_init(&world)
+    world_init(&world, 0x123) // example seed value
     //defer world_shutdown(&world)
 
-    player : Player
-    player_init(&player, vec3{C_SIZE / 2, BASE_HEIGHT + HEIGHT_AMPLITUDE, C_SIZE / 2}, window)
+    player_init(&g_player, vec3{C_SIZE / 2, SEA_HEIGHT + SURFACE_HEIGHT + 10, C_SIZE / 2}, window)
 
     fps_frames := 0
     fps_elapsed := 0.0
@@ -98,26 +113,42 @@ main :: proc() {
             fps_worst_dt = 0
         }
 
-        player_tick(&player, &world, f32(dt))
-        block_interaction(player, &world)
+        player_tick(&g_player, &world, f32(dt))
+        block_interaction(g_player, &world)
 
-        text(10, 10, "voxels")
-        //text(10, 30, "fps: %.2f", fps_elapsed > 0 ? f64(fps_frames) / fps_elapsed : 0)
-        text(10, 30, "%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
+
+        toff :: #force_inline proc(i : int) -> int {return 10 + 20 * i}
+
+        text(10, toff(0), "voxels")
+        text(10, toff(1), "%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
+        text(10, toff(2), "seed: %d", world.seed)
+        text(10, toff(3), "load radius: %d", world.load_radius)
+        text(10, toff(4), "frozen: %v", g_is_frozen)
+
+        text(10, toff(6), "m total allocated: %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_allocated, g_tracking_allocator.total_memory_allocated / 1024, g_tracking_allocator.total_memory_allocated / (1024 * 1024))
+        text(10, toff(7), "m total freed:     %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_freed, g_tracking_allocator.total_memory_freed / 1024, g_tracking_allocator.total_memory_freed / (1024 * 1024))
+        text(10, toff(8), "m peak allocated:  %d (%d KB, %d MB)\n", g_tracking_allocator.peak_memory_allocated, g_tracking_allocator.peak_memory_allocated / 1024, g_tracking_allocator.peak_memory_allocated / (1024 * 1024))
+
         text(
             10,
-            50,
-            "vertex pool utilization: %d / %d %.2f%%",
+            toff(10),
+            "vertex pool utilization: %d/%d [%.2f%%]",
             world.vertex_pool.page_count - world.vertex_pool.free_pages,
             world.vertex_pool.page_count,
             f32(world.vertex_pool.page_count - world.vertex_pool.free_pages) / f32(world.vertex_pool.page_count) * 100,
         )
 
         if renderer_begin_frame() {
-            face_count := world_render(&world, player.view_proj, draw_lines = true)
-            text(10, 70, "face count: %d", face_count)
+            cull_cam := g_is_frozen ? g_frozen_cam : g_player.camera
+            face_count := world_render(&world, g_player.camera, cull_cam, draw_lines = true)
+            text(10, toff(11), "face count: %d", face_count)
+            text(10, toff(12), "chunk count: %d", world.chunk_count)
 
-            iml_render(player.view_proj)
+            if g_is_frozen {
+                iml_frustum(g_frozen_cam, 0xFF0000FF)
+            }
+
+            iml_render(g_player.camera.view_proj)
             renderer_end_frame()
         }
 
@@ -128,7 +159,7 @@ main :: proc() {
 @(private = "file")
 block_interaction :: proc(p : Player, w : ^World) {
     xpos, ypos := glfw.GetCursorPos(p.window)
-    eye, dir, ok := player_get_ray(p, xpos, ypos)
+    eye, dir, ok := camera_get_ray(p.camera, xpos, ypos)
 
     if !ok do return
 
@@ -183,5 +214,12 @@ input_mouse_button_callback :: proc "c" (window : glfw.WindowHandle, button, act
 input_key_callback :: proc "c" (window : glfw.WindowHandle, key, scancode, action, mods : i32) {
     if key == glfw.KEY_ESCAPE && action == glfw.PRESS {
         glfw.SetWindowShouldClose(window, true)
+    }
+
+    if (key == glfw.KEY_F1 && action == glfw.PRESS) {
+        g_is_frozen = !g_is_frozen
+        if g_is_frozen {
+            g_frozen_cam = camera_snapshot(g_player.camera)
+        }
     }
 }

@@ -10,13 +10,25 @@ import "core:math/noise"
 COL_HEIGHT :: 16
 MAX_FACES :: C_VOLUME * 3 // * 3 for opaque, * 6 if transparent?
 RENDER_CAP :: 4096
+CMD_CAP :: RENDER_CAP * 6
 
 NEIGHBOUR_DIRS :: [4]ivec2{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
-
 Column_Heights :: [C_SIZE][C_SIZE]i32
-BASE_HEIGHT :: 34
-HEIGHT_AMPLITUDE :: 16
-NOISE_FREQ :: 1.0 / 128.0
+
+// TODO: implement biome specific params
+SEA_HEIGHT :: 64
+SURFACE_HEIGHT :: 20.0 // baseline surface above sea level
+SQUASH :: 0.8
+
+// continental
+CONT_OCTAVE :: 4
+CONT_FREQ :: 1.0 / 700.0 // broad surface shape
+CONT_AMP :: 28.0 // how much the surface rolls
+
+// 3D density carve
+DENSE_OCTAVE :: 4
+DENSE_FREQ :: 1.0 / 110.0
+DENSE_AMP :: 10.0
 
 
 
@@ -28,8 +40,9 @@ Per_Chunk_Data :: struct {
 
 @(private = "file")
 Mesh_Result :: struct {
-    loc :    ivec3,
-    handle : Mesh_Handle,
+    loc :         ivec3,
+    handle :      Mesh_Handle,
+    face_counts : [6]u32,
 }
 
 Column_State :: enum u8 {
@@ -41,6 +54,8 @@ Column_State :: enum u8 {
 World :: struct {
     chunks :          map[ivec3]^Chunk,
     chunks_mu :       sync.RW_Mutex,
+
+    //
     columns :         map[ivec2]Column_State,
     columns_mu :      sync.Mutex,
     gen_thread :      Worker(ivec2),
@@ -49,9 +64,15 @@ World :: struct {
     mesh_results :    queue.Queue(Mesh_Result),
     mesh_results_mu : sync.Mutex,
 
+    //
+    load_radius :     i32,
+    seed :            i64,
+
+    //
+
     // rendering
-    render_count :    u32,
-    render_cap :      u32,
+    chunk_count :     u32,
+    cmd_count :       u32,
     cmds :            [^]gl.DrawArraysIndirectCommand,
     data :            [^]Per_Chunk_Data,
     cmd_buffer :      u32,
@@ -61,7 +82,7 @@ World :: struct {
     vp_loc :          i32,
 }
 
-world_init :: proc(w : ^World) {
+world_init :: proc(w : ^World, seed : i64) {
     ok : bool
     w.chunk_program, ok = load_program("chunk", "../assets/chunk.vert", "../assets/chunk.frag")
     if !ok {
@@ -73,19 +94,20 @@ world_init :: proc(w : ^World) {
     w.chunks = make(map[ivec3]^Chunk, context.allocator)
     w.columns = make(map[ivec2]Column_State, context.allocator)
     w.exiting = false
-    w.render_cap = RENDER_CAP
+    w.load_radius = 3
+    w.seed = seed
     queue.init(&w.mesh_results, allocator = context.allocator)
 
     storage_flags : u32 = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT
     mapping_flags : u32 = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT | gl.MAP_FLUSH_EXPLICIT_BIT
-    w.cmds = create_mapped_buffer(&w.cmd_buffer, w.render_cap, storage_flags, mapping_flags, "Chunk_Batch_cmd_buf", gl.DrawArraysIndirectCommand)
-    w.data = create_mapped_buffer(&w.data_buffer, w.render_cap, storage_flags, mapping_flags, "Chunk_Batch_data_buf", Per_Chunk_Data)
+    w.cmds = create_mapped_buffer(&w.cmd_buffer, CMD_CAP, storage_flags, mapping_flags, "Chunk_Batch_cmd_buf", gl.DrawArraysIndirectCommand)
+    w.data = create_mapped_buffer(&w.data_buffer, RENDER_CAP, storage_flags, mapping_flags, "Chunk_Batch_data_buf", Per_Chunk_Data)
     //vertex_arena_init(&w.vertex_arena, 16 * mem.Megabyte)
     vertex_pool_init(&w.vertex_pool, 16 * mem.Megabyte, 256, context.allocator)
 
     MESH_SCRATCH_SIZE :: MAX_FACES * size_of(Chunk_Face)
-    worker_init(&w.gen_thread, gen_thread_proc, w, 0)
-    worker_init(&w.mesh_thread, mesh_thread_proc, w, MESH_SCRATCH_SIZE)
+    worker_init(&w.gen_thread, gen_thread_proc, w, 0, "gen_thread")
+    worker_init(&w.mesh_thread, mesh_thread_proc, w, MESH_SCRATCH_SIZE, "mesh_thread")
 
     load_init_chunks(w)
     fmt.printf("world initialized\n")
@@ -95,8 +117,15 @@ world_init :: proc(w : ^World) {
 load_init_chunks :: proc(w : ^World) {
     sync.rw_mutex_guard(&w.chunks_mu)
     sync.mutex_guard(&w.columns_mu)
-    for x := 0; x <= 6; x += 1 {
-        for z := 0; z <= 6; z += 1 {
+
+    size := 1 + int(w.load_radius) * 2
+    t := size
+    x, z, dx, dz : int
+    dz = -1
+    i := 0
+
+    for _ in 0 ..< (size * size) {
+        if (-size / 2 <= x) && (x <= size / 2) && (-size / 2 <= z) && (z <= size / 2) {
             col := ivec2{i32(x), i32(z)}
             if _, ok := w.columns[col]; ok {
                 continue
@@ -110,9 +139,19 @@ load_init_chunks :: proc(w : ^World) {
             }
             w.columns[col] = .Allocated
             worker_push(&w.gen_thread, col)
+            i += 1
         }
+
+        if (x == z) || ((x < 0) && (x == -z)) || ((x > 0) && (x == 1 - z)) {
+            t = dx
+            dx = -dz
+            dz = t
+        }
+        x += dx
+        z += dz
     }
 }
+
 
 world_set_block :: proc(w : ^World, pos : ivec3, block : Block) -> bool {
     sync.rw_mutex_shared_guard(&w.chunks_mu)
@@ -143,7 +182,8 @@ loc_world_chunk_local :: proc(pos : ivec3) -> (chunk, local : ivec3) {
     return
 }
 
-world_render :: proc(w : ^World, vp : mat4, draw_lines : bool = false) -> u32 {
+// cull_cam : Maybe(Camera) = nil ? 
+world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : bool = false) -> u32 {
     renderer_group("world_render")
 
     // handle mesh results
@@ -157,6 +197,7 @@ world_render :: proc(w : ^World, vp : mat4, draw_lines : bool = false) -> u32 {
         if result.handle.count > 0 do vertex_pool_publish(&w.vertex_pool, result.handle)
         vertex_pool_free(&w.vertex_pool, chunk.handle)
         chunk.handle = result.handle
+        chunk.face_counts = result.face_counts
     }
     sync.mutex_unlock(&w.mesh_results_mu)
 
@@ -164,47 +205,50 @@ world_render :: proc(w : ^World, vp : mat4, draw_lines : bool = false) -> u32 {
     vertex_pool_commit(&w.vertex_pool)
 
     // collect chunks
-    w.render_count = 0
+    w.cmd_count = 0
+    w.chunk_count = 0
     face_count : u32 = 0
+
+
 
     sync.rw_mutex_shared_lock(&w.chunks_mu)
     for _, chunk in w.chunks {
-        push_chunk(w, chunk)
-        face_count += chunk.handle.count
+        face_count += push_chunk_for_render(w, chunk, cull_cam)
 
         if draw_lines && chunk.blocks != nil {
             min_pos := chunk.pos * C_SIZE
             max_pos := min_pos + ivec3{C_SIZE, C_SIZE, C_SIZE}
-           // color := u32(chunk.blocks != nil ? 0xFFFFFFFF : 0xFFFFFF1E)
+            // color := u32(chunk.blocks != nil ? 0xFFFFFFFF : 0xFFFFFF1E)
             iml_bounds(vec3(min_pos), vec3(max_pos), 0xFFFFFF1E)
         }
     }
     sync.rw_mutex_shared_unlock(&w.chunks_mu)
 
-    if w.render_count <= 0 do return 0
+    if w.cmd_count == 0 do return 0
 
-    gl.FlushMappedNamedBufferRange(w.cmd_buffer, 0, int(w.render_count) * size_of(gl.DrawArraysIndirectCommand))
-    gl.FlushMappedNamedBufferRange(w.data_buffer, 0, int(w.render_count) * size_of(Per_Chunk_Data))
+    gl.FlushMappedNamedBufferRange(w.cmd_buffer, 0, int(w.cmd_count) * size_of(gl.DrawArraysIndirectCommand))
+    gl.FlushMappedNamedBufferRange(w.data_buffer, 0, int(w.chunk_count) * size_of(Per_Chunk_Data))
 
     gl.Enable(gl.DEPTH_TEST)
     gl.Enable(gl.CULL_FACE)
     gl.CullFace(gl.BACK)
     gl.UseProgram(w.chunk_program)
 
-    vp := vp
+    vp := cam.view_proj
     gl.UniformMatrix4fv(0, 1, false, &vp[0, 0])
 
     renderer_bind_empty_vao()
     gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, w.vertex_pool.buffer)
     gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 1, w.data_buffer)
     gl.BindBuffer(gl.DRAW_INDIRECT_BUFFER, w.cmd_buffer)
-    gl.MultiDrawArraysIndirect(gl.TRIANGLES, nil, i32(w.render_count), 0)
+    gl.MultiDrawArraysIndirect(gl.TRIANGLES, nil, i32(w.cmd_count), 0)
 
     return face_count
 }
 
+/*
 @(private = "file")
-push_chunk :: proc(w : ^World, chunk : ^Chunk) -> bool {
+push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk) -> bool {
     handle := chunk.handle
     if handle.count == 0 do return false
     if w.render_count >= w.render_cap do return false
@@ -219,6 +263,54 @@ push_chunk :: proc(w : ^World, chunk : ^Chunk) -> bool {
     w.render_count += 1
     return true
 }
+*/
+
+@(private = "file")
+push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (faces_pushed : u32) {
+    handle := chunk.handle
+    if handle.count == 0 do return 0
+    if w.chunk_count >= RENDER_CAP || w.cmd_count + 6 > CMD_CAP do return 0
+
+    min_pos := vec3(chunk.pos * C_SIZE)
+    max_pos := min_pos + C_SIZE
+
+    if camera_aabb_in_view(cam, min_pos, max_pos) == false do return 0
+
+    //a face with normal +X sits on a plane in (min.x, max.x] so it can only be front-facing when the camera is past min.x
+    visible := [6]bool {
+        cam.pos.x > min_pos.x, // +X
+        cam.pos.x < max_pos.x, // -X
+        cam.pos.y > min_pos.y, // +Y
+        cam.pos.y < max_pos.y, // -Y
+        cam.pos.z > min_pos.z, // +Z
+        cam.pos.z < max_pos.z, // -Z
+    }
+
+    data_index := w.chunk_count
+    offset := handle.offset
+    for face in 0 ..< 6 {
+        count := chunk.face_counts[face]
+        start := offset
+        offset += count
+        if count == 0 || !visible[face] do continue
+
+        w.cmds[w.cmd_count] = gl.DrawArraysIndirectCommand {
+            count         = count * 6,
+            instanceCount = 1,
+            first         = start * 6,
+            baseInstance  = data_index,
+        }
+        w.cmd_count += 1
+        faces_pushed += count
+    }
+
+    if faces_pushed == 0 do return 0
+
+    w.data[data_index] = Per_Chunk_Data{chunk.pos.x * C_SIZE, chunk.pos.y * C_SIZE, chunk.pos.z * C_SIZE, 0}
+    w.chunk_count += 1
+    return
+}
+
 
 @(private = "file")
 set_block_internal :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
@@ -294,22 +386,19 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     world := cast(^World)user_data
 
     column : [COL_HEIGHT]^Chunk
-    for i in 0 ..< COL_HEIGHT do column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
-
-    heights : Column_Heights
-    max_height := gen_heights(loc, &heights)
-    top_chunk := (max_height - 1) >> C_SHIFT
-
-    for i in 0 ..= top_chunk do if column[i] != nil {
-        gen_shape(world, column[i], &heights)
+    for i in 0 ..< COL_HEIGHT {
+        column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
+        gen_shape(world, column[i])
     }
 
+    /*
     gen_surface(world, &column, &heights)
 
 
+    */
 
     if column[0] != nil do gen_mantle(world, column[0])
-    
+
     ready : [5]ivec2
     ready_count := 0
 
@@ -331,6 +420,7 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     sync.mutex_unlock(&world.columns_mu)
 
     // All chunks, including empty ones, so the mesher clears their initial dirty flag.
+    // TODO: maybe not
     for c in ready[:ready_count] {
         for i in 0 ..< COL_HEIGHT {
             pos := ivec3{c.x, i32(i), c.y}
@@ -340,29 +430,33 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
 }
 
 @(private = "file")
-gen_heights :: proc(loc : ivec2, heights : ^Column_Heights) -> (max_height : i32) {
+gen_shape :: proc(w : ^World, chunk : ^Chunk) {
 
-    for x in 0 ..< i32(C_SIZE) {
-        for z in 0 ..< i32(C_SIZE) {
-            wx := f64(loc.x * C_SIZE + x)
-            wz := f64(loc.y * C_SIZE + z)
-            n := noise.noise_2d(0, {wx * NOISE_FREQ, wz * NOISE_FREQ})
-            h := clamp(BASE_HEIGHT + i32(n * HEIGHT_AMPLITUDE), 1, COL_HEIGHT * C_SIZE)
-            heights[x][z] = h
-            max_height = max(max_height, h)
-        }
-    }
-    return
-}
+    vol : Noise_Volume
+    noise_vol_fill(
+        &vol,
+        w.seed,
+        chunk.pos * C_SIZE,
+        proc(seed : i64, wx, wy, wz : f64, ctx : rawptr) -> f64 {
+            cont := noise_fbm(seed + 0x44, wx, wz, CONT_OCTAVE, CONT_FREQ) // [-1,1]
+            cont *= CONT_AMP
 
-@(private = "file")
-gen_shape :: proc(w : ^World, chunk : ^Chunk, heights : ^Column_Heights) {
+            carve := noise_fbm(seed + 0x11, wx, wy, wz, DENSE_OCTAVE, DENSE_FREQ) // [-1,1]
+            carve *= DENSE_AMP
+
+            surface := f64(SEA_HEIGHT) + SURFACE_HEIGHT + cont
+            return carve + (surface - wy) * SQUASH
+        },
+    )
+
     base_y := chunk.pos.y * C_SIZE
     for x in 0 ..< i32(C_SIZE) {
         for z in 0 ..< i32(C_SIZE) {
-            top := min(heights[x][z] - base_y, C_SIZE)
-            for y in 0 ..< top {
-                world_set_chunk_block(w, chunk, x, y, z, .Stone)
+            for y : i32 = C_SIZE - 1; y >= 0; y -= 1 {
+                d := noise_vol_sample(&vol, x, y, z)
+                if d > 0 {
+                    world_set_chunk_block(w, chunk, x, y, z, .Stone)
+                }
             }
         }
     }
@@ -415,11 +509,13 @@ mesh_thread_proc :: proc(loc : ivec3, scratch : mem.Allocator, user_data : rawpt
     chunk_clear_mesh_dirty(chunk)
 
     handle : Mesh_Handle
+    face_counts : [6]u32
     if chunk.num_filled > 0 {
         bytes, err := mem.alloc_bytes_non_zeroed(MAX_FACES * size_of(Chunk_Face), align_of(Chunk_Face), scratch)
         assert(err == nil, "mesh scratch arena too small")
         face_buffer := mem.slice_data_cast([]Chunk_Face, bytes)
-        face_count := u32(chunk_generate_faces(chunk, face_buffer))
+        face_count : u32
+        face_count, face_counts = chunk_generate_faces(chunk, face_buffer)
 
         if face_count > 0 {
             ok : bool
@@ -432,6 +528,6 @@ mesh_thread_proc :: proc(loc : ivec3, scratch : mem.Allocator, user_data : rawpt
     }
 
     sync.mutex_lock(&world.mesh_results_mu)
-    queue.push_back(&world.mesh_results, Mesh_Result{loc, handle})
+    queue.push_back(&world.mesh_results, Mesh_Result{loc, handle, face_counts})
     sync.mutex_unlock(&world.mesh_results_mu)
 }

@@ -71,7 +71,7 @@ ivec3 get_voxel_pos(uint face, uint corner_index) {
 void main () {
     FaceQuad q = quads[gl_VertexID / 6];
     
-    ChunkData chunk_data = per_chunk[gl_DrawID];
+    ChunkData chunk_data = per_chunk[gl_BaseInstance];
     ivec3 chunk_pos = ivec3(chunk_data.x, chunk_data.y, chunk_data.z);
 
     uint face;

@@ -21,6 +21,8 @@ C_VOLUME :: (C_SIZE * C_SIZE * C_SIZE)
 C_SIZE_PAD :: C_SIZE + 2
 C_VOL_PAD :: C_SIZE_PAD * C_SIZE_PAD * C_SIZE_PAD
 
+MAX_FACES_PER_DIR :: C_VOLUME / 2
+
 @(rodata)
 CARDINAL := [6]ivec3 {
     ivec3{1, 0, 0}, // Right
@@ -45,6 +47,7 @@ Chunk :: struct {
     num_filled :      u32,
     dirty :           b32,
     handle :          Mesh_Handle,
+    face_counts :     [6]u32, // TODO: move to handle?
 }
 
 chunk_init :: proc(c : ^Chunk, pos : [3]i32, allocator : runtime.Allocator = context.allocator) {
@@ -109,6 +112,7 @@ chunk_clear_mesh_dirty :: proc "contextless" (chunk : ^Chunk) {
     intrinsics.atomic_store(&chunk.dirty, false)
 }
 
+/*
 chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
     if chunk.num_filled == 0 do return 0
     count : u32 = 0
@@ -131,10 +135,45 @@ chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
         }
     }
 
-    chunk.dirty = false
     return count
 }
+*/
 
+
+chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> (total : u32, counts : [6]u32) {
+    if chunk.num_filled == 0 do return
+    assert(len(faces_out) >= 6 * MAX_FACES_PER_DIR)
+
+    for z in 0 ..< i32(C_SIZE) {
+        for y in 0 ..< i32(C_SIZE) {
+            for x in 0 ..< i32(C_SIZE) {
+                pos := ivec3{x, y, z}
+                block := chunk_get_block(chunk, pos.x, pos.y, pos.z)
+                if block == .Air do continue
+
+                for face in 0 ..< 6 {
+                    npos := pos + CARDINAL[face]
+                    if is_solid(chunk, npos) do continue
+                    ao := get_face_ao_packed(chunk, pos.x, pos.y, pos.z, face)
+                    faces_out[face * MAX_FACES_PER_DIR + int(counts[face])] = make_face(pos, face, u32(block) - 1, ao)
+                    counts[face] += 1
+                }
+            }
+        }
+    }
+
+    // compact the faces from each directional bucket
+    write := int(counts[0])
+    for face in 1 ..< 6 {
+        n := int(counts[face])
+        src := face * MAX_FACES_PER_DIR
+        copy(faces_out[write:write + n], faces_out[src:src + n])
+        write += n
+    }
+
+    total = u32(write)
+    return
+}
 
 @(private = "file")
 get_face_ao_packed :: proc(chunk : ^Chunk, x, y, z : i32, face : int) -> u32 {
