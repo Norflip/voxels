@@ -3,16 +3,6 @@ import "base:runtime"
 import "core:math/rand"
 import "base:intrinsics"
 
-Block :: enum u8 {
-    Air = 0,
-    Stone,
-    Mantle,
-    Dirt,
-}
-
-block_is_solid :: #force_inline proc(b : Block) -> bool {
-    return b != Block.Air
-}
 
 C_SIZE :: 32
 C_SHIFT :: 5
@@ -112,34 +102,6 @@ chunk_clear_mesh_dirty :: proc "contextless" (chunk : ^Chunk) {
     intrinsics.atomic_store(&chunk.dirty, false)
 }
 
-/*
-chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> u32 {
-    if chunk.num_filled == 0 do return 0
-    count : u32 = 0
-
-    for z in 0 ..< i32(C_SIZE) {
-        for y in 0 ..< i32(C_SIZE) {
-            for x in 0 ..< i32(C_SIZE) {
-                pos := ivec3{x, y, z}
-                block := chunk_get_block(chunk, pos.x, pos.y, pos.z)
-                if block == .Air do continue
-                for face in 0 ..< 6 {
-                    npos := pos + CARDINAL[face]
-                    if !is_solid(chunk, npos) {
-                        ao := get_face_ao_packed(chunk, pos.x, pos.y, pos.z, face)
-                        faces_out[count] = make_face(pos, face, u32(block) - 1, ao)
-                        count += 1
-                    }
-                }
-            }
-        }
-    }
-
-    return count
-}
-*/
-
-
 chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> (total : u32, counts : [6]u32) {
     if chunk.num_filled == 0 do return
     assert(len(faces_out) >= 6 * MAX_FACES_PER_DIR)
@@ -153,7 +115,9 @@ chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> (total
 
                 for face in 0 ..< 6 {
                     npos := pos + CARDINAL[face]
-                    if is_solid(chunk, npos) do continue
+                    neighbour := chunk_get_block(chunk, npos.x, npos.y, npos.z)
+                    if !block_create_face(block, neighbour) do continue
+
                     ao := get_face_ao_packed(chunk, pos.x, pos.y, pos.z, face)
                     faces_out[face * MAX_FACES_PER_DIR + int(counts[face])] = make_face(pos, face, u32(block) - 1, ao)
                     counts[face] += 1

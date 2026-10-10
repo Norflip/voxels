@@ -7,6 +7,10 @@ import "core:sync"
 import gl "vendor:OpenGL"
 import "core:math/noise"
 
+// TODO: implement biome specific params
+// TODO: seperate rendering
+// TODO: seperate world generation
+
 COL_HEIGHT :: 16
 MAX_FACES :: C_VOLUME * 3 // * 3 for opaque, * 6 if transparent?
 RENDER_CAP :: 4096
@@ -15,9 +19,11 @@ CMD_CAP :: RENDER_CAP * 6
 NEIGHBOUR_DIRS :: [4]ivec2{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
 Column_Heights :: [C_SIZE][C_SIZE]i32
 
-// TODO: implement biome specific params
+
+
 SEA_HEIGHT :: 64
 SURFACE_HEIGHT :: 20.0 // baseline surface above sea level
+FLATGRASS_HEIGHT :: 20
 SQUASH :: 0.8
 
 // continental
@@ -54,8 +60,6 @@ Column_State :: enum u8 {
 World :: struct {
     chunks :          map[ivec3]^Chunk,
     chunks_mu :       sync.RW_Mutex,
-
-    //
     columns :         map[ivec2]Column_State,
     columns_mu :      sync.Mutex,
     gen_thread :      Worker(ivec2),
@@ -67,8 +71,7 @@ World :: struct {
     //
     load_radius :     i32,
     seed :            i64,
-
-    //
+    flatgen :         bool,
 
     // rendering
     chunk_count :     u32,
@@ -82,7 +85,7 @@ World :: struct {
     vp_loc :          i32,
 }
 
-world_init :: proc(w : ^World, seed : i64) {
+world_init :: proc(w : ^World, seed : i64, flatgrass : bool = false) {
     ok : bool
     w.chunk_program, ok = load_program("chunk", "../assets/chunk.vert", "../assets/chunk.frag")
     if !ok {
@@ -96,6 +99,7 @@ world_init :: proc(w : ^World, seed : i64) {
     w.exiting = false
     w.load_radius = 3
     w.seed = seed
+    w.flatgen = flatgrass
     queue.init(&w.mesh_results, allocator = context.allocator)
 
     storage_flags : u32 = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT
@@ -127,10 +131,7 @@ load_init_chunks :: proc(w : ^World) {
     for _ in 0 ..< (size * size) {
         if (-size / 2 <= x) && (x <= size / 2) && (-size / 2 <= z) && (z <= size / 2) {
             col := ivec2{i32(x), i32(z)}
-            if _, ok := w.columns[col]; ok {
-                continue
-            }
-
+            if _, ok := w.columns[col]; ok do continue
             for i := COL_HEIGHT - 1; i >= 0; i -= 1 {
                 pos := ivec3{col.x, i32(i), col.y}
                 chunk := new(Chunk, context.allocator)
@@ -182,7 +183,12 @@ loc_world_chunk_local :: proc(pos : ivec3) -> (chunk, local : ivec3) {
     return
 }
 
-// cull_cam : Maybe(Camera) = nil ? 
+world_get_player_spawn :: proc(w : ^World) -> vec3 {
+    if w.flatgen do return vec3{C_SIZE / 2, FLATGRASS_HEIGHT + 4, C_SIZE / 2}
+    return vec3{C_SIZE / 2, SEA_HEIGHT + SURFACE_HEIGHT + 4, C_SIZE / 2}
+}
+
+// cull_cam : Maybe(Camera) = nil ?
 world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : bool = false) -> u32 {
     renderer_group("world_render")
 
@@ -208,8 +214,6 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
     w.cmd_count = 0
     w.chunk_count = 0
     face_count : u32 = 0
-
-
 
     sync.rw_mutex_shared_lock(&w.chunks_mu)
     for _, chunk in w.chunks {
@@ -384,18 +388,20 @@ get_chunk_unsafe :: proc(world : ^World, pos : ivec3) -> ^Chunk {
 @(private = "file")
 gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     world := cast(^World)user_data
-
     column : [COL_HEIGHT]^Chunk
-    for i in 0 ..< COL_HEIGHT {
-        column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
-        gen_shape(world, column[i])
+
+    if world.flatgen {
+        max_col_y := (FLATGRASS_HEIGHT / C_SIZE) + 1
+        for i in 0 ..< max_col_y {
+            column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
+            gen_flat_shape(world, column[i])
+        }
+    } else {
+        for i in 0 ..< COL_HEIGHT {
+            column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
+            gen_shape(world, column[i])
+        }
     }
-
-    /*
-    gen_surface(world, &column, &heights)
-
-
-    */
 
     if column[0] != nil do gen_mantle(world, column[0])
 
@@ -438,10 +444,10 @@ gen_shape :: proc(w : ^World, chunk : ^Chunk) {
         w.seed,
         chunk.pos * C_SIZE,
         proc(seed : i64, wx, wy, wz : f64, ctx : rawptr) -> f64 {
-            cont := noise_fbm(seed + 0x44, wx, wz, CONT_OCTAVE, CONT_FREQ) // [-1,1]
+            cont := noise_fbm(seed + 0x44, wx, wz, CONT_OCTAVE, CONT_FREQ) // fbm returns [-1,1]
             cont *= CONT_AMP
 
-            carve := noise_fbm(seed + 0x11, wx, wy, wz, DENSE_OCTAVE, DENSE_FREQ) // [-1,1]
+            carve := noise_fbm(seed + 0x11, wx, wy, wz, DENSE_OCTAVE, DENSE_FREQ)
             carve *= DENSE_AMP
 
             surface := f64(SEA_HEIGHT) + SURFACE_HEIGHT + cont
@@ -457,6 +463,20 @@ gen_shape :: proc(w : ^World, chunk : ^Chunk) {
                 if d > 0 {
                     world_set_chunk_block(w, chunk, x, y, z, .Stone)
                 }
+            }
+        }
+    }
+}
+
+@(private = "file")
+gen_flat_shape :: proc(w : ^World, chunk : ^Chunk) {
+    base_y := chunk.pos.y * C_SIZE
+    for x in 0 ..< i32(C_SIZE) {
+        for z in 0 ..< i32(C_SIZE) {
+            for y : i32 = C_SIZE - 1; y >= 0; y -= 1 {
+                world_y := base_y + y
+                if world_y > FLATGRASS_HEIGHT do continue
+                world_set_chunk_block(w, chunk, x, y, z, .Stone)
             }
         }
     }

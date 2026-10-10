@@ -31,7 +31,7 @@ _ctx : struct {
 _vertices : [MAX_LINE_VERTICES]Line_Vertex
 
 iml_init :: proc() -> bool {
-    program, ok := load_program("line_prog", "../assets/line.vert", "../assets/line.frag")
+    program, ok := load_program("line", "../assets/line.vert", "../assets/line.frag")
     if !ok {
         fmt.eprintln("iml: failed to load debug line shaders")
         return false
@@ -76,6 +76,11 @@ iml_render :: proc(vp : mat4) {
 
     gl.DrawArrays(gl.LINES, 0, vertex_count)
     gl.Disable(gl.BLEND)
+    _ctx.count = 0
+}
+
+iml_clear :: proc() {
+    if !_ctx.initialized do return
     _ctx.count = 0
 }
 

@@ -46,6 +46,10 @@ _ctx : struct {
     in_frame :           bool,
     initialized :        bool,
 
+    //
+    skybox_program :     u32,
+
+
     // quad rendering
     program :            u32,
     quads :              u32,
@@ -56,6 +60,9 @@ _ctx : struct {
     proj_u_loc :         i32,
 }
 
+@(private = "file")
+g_active_camera : Camera
+
 renderer_init :: proc(backbuffer_width, backbuffer_height : i32) -> bool {
     assert(!_ctx.initialized, "renderer_init called twice")
 
@@ -65,14 +72,22 @@ renderer_init :: proc(backbuffer_width, backbuffer_height : i32) -> bool {
     gl.CreateVertexArrays(1, &_ctx.empty_vao)
     when ODIN_DEBUG do gl.ObjectLabel(gl.VERTEX_ARRAY, _ctx.empty_vao, -1, "renderer_empty_vao")
 
-    program, program_ok := load_program("blit", "../assets/blit.vert", "../assets/blit.frag")
-    if !program_ok {
+    ok : bool
+
+    _ctx.blit_program, ok = load_program("blit", "../assets/blit.vert", "../assets/blit.frag")
+    if !ok {
         gl.DeleteVertexArrays(1, &_ctx.empty_vao)
         _ctx.empty_vao = 0
         return false
     }
-    _ctx.blit_program = program
-    when ODIN_DEBUG do gl.ObjectLabel(gl.PROGRAM, _ctx.blit_program, -1, "renderer_blit_program")
+
+    _ctx.skybox_program, ok = load_program("skybox", "../assets/sky.vert", "../assets/sky.frag")
+    if !ok {
+        fmt.eprintln("failed to load skybox shader")
+        gl.DeleteVertexArrays(1, &_ctx.empty_vao)
+        _ctx.empty_vao = 0
+        return false
+    }
 
     _ctx.initialized = true
     renderer_resize(backbuffer_width, backbuffer_height)
@@ -105,11 +120,12 @@ renderer_resize :: proc(backbuffer_width, backbuffer_height : i32) {
     _ctx.target = rt_create(backbuffer_width, backbuffer_height)
 }
 
-renderer_begin_frame :: proc(clear_color := [4]f32{0.1, 0.1, 0.2, 1.0}) -> bool {
+renderer_begin_frame :: proc(cam : Camera) -> bool {
     assert(_ctx.initialized, "renderer_begin_frame called before renderer_init")
     assert(!_ctx.in_frame, "renderer_begin_frame called twice without renderer_end_frame")
 
     if _ctx.backbuffer_width <= 0 || _ctx.backbuffer_height <= 0 do return false
+    g_active_camera = cam
 
     gl.BindFramebuffer(gl.FRAMEBUFFER, _ctx.target.framebuffer)
     gl.Viewport(0, 0, _ctx.target.width, _ctx.target.height)
@@ -122,10 +138,10 @@ renderer_begin_frame :: proc(clear_color := [4]f32{0.1, 0.1, 0.2, 1.0}) -> bool 
     gl.CullFace(gl.BACK)
     gl.Disable(gl.BLEND)
 
-    color := clear_color
     clear_depth : f32 = 1
-    gl.ClearNamedFramebufferfv(_ctx.target.framebuffer, gl.COLOR, 0, &color[0])
     gl.ClearNamedFramebufferfv(_ctx.target.framebuffer, gl.DEPTH, 0, &clear_depth)
+    // no need if we are rendering a skybox on top
+    //gl.ClearNamedFramebufferfv(_ctx.target.framebuffer, gl.COLOR, 0, &color[0])
 
     _ctx.in_frame = true
     return true
@@ -134,6 +150,26 @@ renderer_begin_frame :: proc(clear_color := [4]f32{0.1, 0.1, 0.2, 1.0}) -> bool 
 renderer_end_frame :: proc() {
     renderer_assert_can_render()
     assert(_ctx.group_depth == 0, "renderer_end_frame called with unclosed render groups")
+
+    renderer_bind_empty_vao()
+
+    {
+        renderer_group("skybox")
+        gl.DepthFunc(gl.LEQUAL)
+        gl.DepthMask(false)
+        gl.Disable(gl.CULL_FACE)
+        gl.UseProgram(_ctx.skybox_program)
+
+        inv_proj := g_active_camera.inv_proj
+        view := g_active_camera.view
+        gl.UniformMatrix4fv(0, 1, gl.FALSE, raw_data(&inv_proj))
+        gl.UniformMatrix4fv(1, 1, gl.FALSE, raw_data(&view))
+
+        gl.DrawArrays(gl.TRIANGLES, 0, 3)
+        gl.DepthMask(true)
+        gl.DepthFunc(gl.LESS)
+        gl.Enable(gl.CULL_FACE)
+    }
 
     {
         renderer_group("blit")
@@ -146,7 +182,6 @@ renderer_end_frame :: proc() {
 
         gl.UseProgram(_ctx.blit_program)
         gl.BindTextureUnit(0, _ctx.target.color_texture)
-        gl.BindVertexArray(_ctx.empty_vao)
         gl.DrawArrays(gl.TRIANGLES, 0, 3)
     }
 
@@ -275,7 +310,7 @@ rt_destroy :: proc(target : ^Render_Target) {
 @(private = "file")
 init_text :: proc() {
     ok : bool
-    _ctx.program, ok = load_program("text_prog", "../assets/text.vert", "../assets/text.frag")
+    _ctx.program, ok = load_program("text", "../assets/text.vert", "../assets/text.frag")
     if !ok do return
 
     gl.CreateBuffers(1, &_ctx.quads)

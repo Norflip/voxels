@@ -3,8 +3,8 @@ import "base:runtime"
 import m "core:math/linalg/glsl"
 import "core:math/noise"
 
-JUMPS_XZ :: 4
-JUMPS_Y :: 8
+JUMPS_XZ :: 8
+JUMPS_Y :: 16
 STEPS_XZ :: (C_SIZE / JUMPS_XZ) + 1
 STEPS_Y :: (C_SIZE / JUMPS_Y) + 1
 
@@ -71,9 +71,9 @@ vol_index :: #force_inline proc "contextless" (x, y, z : i32) -> i32 {
 /*
     fractal brownian
 */
-
 //TODO: should we multiply the octave index by some constant to decorrelate octaves?
 
+// fbm returns [-1,1]
 noise_fbm :: proc {
     noise_fbm_2d,
     noise_fbm_3d,

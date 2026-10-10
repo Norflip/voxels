@@ -20,6 +20,7 @@ Camera :: struct {
     orientation :   m.quat,
     view :          m.mat4,
     proj :          m.mat4,
+    inv_proj :      m.mat4,
     view_proj :     m.mat4,
     frustum :       [6]vec4,
     width, height : int, // window coords, matches glfw.GetCursorPos
@@ -64,6 +65,7 @@ camera_resize :: proc(c : ^Camera, width, height : int) {
     c.height = height
     aspect := f32(width) / f32(height)
     c.proj = m.mat4Perspective(m.radians(f32(FOV)), aspect, NEAR_Z, FAR_Z)
+    c.inv_proj = m.inverse(c.proj)
     c.dirty = true
 }
 

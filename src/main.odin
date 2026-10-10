@@ -24,6 +24,7 @@ MOUSE_BUTTON_COUNT :: glfw.MOUSE_BUTTON_LAST + 1
 mouse_pressed : [MOUSE_BUTTON_COUNT]bool
 
 g_tracking_allocator : mem.Tracking_Allocator
+g_draw_lines : bool = true
 
 main :: proc() {
     when ODIN_DEBUG {
@@ -79,10 +80,10 @@ main :: proc() {
     defer iml_cleanup()
 
     world : World
-    world_init(&world, 0x123) // example seed value
-    //defer world_shutdown(&world)
+    world_init(&world, 0x123, false)
+    // defer world_shutdown(&world)
 
-    player_init(&g_player, vec3{C_SIZE / 2, SEA_HEIGHT + SURFACE_HEIGHT + 10, C_SIZE / 2}, window)
+    player_init(&g_player, world_get_player_spawn(&world), window)
 
     fps_frames := 0
     fps_elapsed := 0.0
@@ -119,41 +120,69 @@ main :: proc() {
 
         toff :: #force_inline proc(i : int) -> int {return 10 + 20 * i}
 
-        text(10, toff(0), "voxels")
-        text(10, toff(1), "%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
-        text(10, toff(2), "seed: %d", world.seed)
-        text(10, toff(3), "load radius: %d", world.load_radius)
-        text(10, toff(4), "frozen: %v", g_is_frozen)
+        text_area(10, 10, 4, 20)
+        textln("voxels")
+        textln("%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
+        textln("--------------------------------")
+        textln("seed: %d", world.seed)
+        textln("load radius: %d", world.load_radius)
+        textln("frozen: %v", g_is_frozen)
+        textln("player pos: [%v %v %v]", int(g_player.pos.x), int(g_player.pos.y), int(g_player.pos.z))
+        textln("--------------------------------")
+        textln("m total allocated: %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_allocated, g_tracking_allocator.total_memory_allocated / 1024, g_tracking_allocator.total_memory_allocated / (1024 * 1024))
+        textln("m total freed:     %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_freed, g_tracking_allocator.total_memory_freed / 1024, g_tracking_allocator.total_memory_freed / (1024 * 1024))
+        textln("m peak allocated:  %d (%d KB, %d MB)\n", g_tracking_allocator.peak_memory_allocated, g_tracking_allocator.peak_memory_allocated / 1024, g_tracking_allocator.peak_memory_allocated / (1024 * 1024))
+        textln("--------------------------------")
 
-        text(10, toff(6), "m total allocated: %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_allocated, g_tracking_allocator.total_memory_allocated / 1024, g_tracking_allocator.total_memory_allocated / (1024 * 1024))
-        text(10, toff(7), "m total freed:     %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_freed, g_tracking_allocator.total_memory_freed / 1024, g_tracking_allocator.total_memory_freed / (1024 * 1024))
-        text(10, toff(8), "m peak allocated:  %d (%d KB, %d MB)\n", g_tracking_allocator.peak_memory_allocated, g_tracking_allocator.peak_memory_allocated / 1024, g_tracking_allocator.peak_memory_allocated / (1024 * 1024))
-
-        text(
-            10,
-            toff(10),
+        textln(
             "vertex pool utilization: %d/%d [%.2f%%]",
             world.vertex_pool.page_count - world.vertex_pool.free_pages,
             world.vertex_pool.page_count,
             f32(world.vertex_pool.page_count - world.vertex_pool.free_pages) / f32(world.vertex_pool.page_count) * 100,
         )
 
-        if renderer_begin_frame() {
-            cull_cam := g_is_frozen ? g_frozen_cam : g_player.camera
-            face_count := world_render(&world, g_player.camera, cull_cam, draw_lines = true)
-            text(10, toff(11), "face count: %d", face_count)
-            text(10, toff(12), "chunk count: %d", world.chunk_count)
+        if renderer_begin_frame(g_player.camera) {
+            face_count := world_render(&world, g_player.camera, g_is_frozen ? g_frozen_cam : g_player.camera, draw_lines = true)
+            textln("face count: %d", face_count)
+            textln("chunk count: %d", world.chunk_count)
 
             if g_is_frozen {
                 iml_frustum(g_frozen_cam, 0xFF0000FF)
             }
 
-            iml_render(g_player.camera.view_proj)
+
+            if g_draw_lines {
+                iml_render(g_player.camera.view_proj)
+            } else {
+                iml_clear()
+            }
+
             renderer_end_frame()
         }
 
         glfw.SwapBuffers(window)
     }
+}
+
+Text_Area :: struct {
+    x :    int,
+    y :    int,
+    pad :  int,
+    size : int,
+}
+
+@(private = "file")
+text_area_inst : Text_Area = Text_Area{0, 0, 0, 16}
+
+@(private = "file")
+text_area :: #force_inline proc(x, y, padding : int, size : int = 16) {
+    text_area_inst = Text_Area{x, y, padding, size}
+}
+
+@(private = "file")
+textln :: #force_inline proc(fmt_str : string, args : ..any, color : u32 = WHITE) {
+    text(text_area_inst.x, text_area_inst.y, fmt_str, ..args, size = text_area_inst.size, color = color)
+    text_area_inst.y += text_area_inst.pad + text_area_inst.size
 }
 
 @(private = "file")
@@ -221,5 +250,9 @@ input_key_callback :: proc "c" (window : glfw.WindowHandle, key, scancode, actio
         if g_is_frozen {
             g_frozen_cam = camera_snapshot(g_player.camera)
         }
+    }
+
+    if key == glfw.KEY_F2 && action == glfw.PRESS {
+        g_draw_lines = !g_draw_lines
     }
 }
