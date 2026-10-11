@@ -119,7 +119,9 @@ chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> (total
                     if !block_create_face(block, neighbour) do continue
 
                     ao := get_face_ao_packed(chunk, pos.x, pos.y, pos.z, face)
-                    faces_out[face * MAX_FACES_PER_DIR + int(counts[face])] = make_face(pos, face, u32(block) - 1, ao)
+                    tex, ok := block_get_atlas_index(block, face)
+                    if !ok do continue
+                    faces_out[face * MAX_FACES_PER_DIR + int(counts[face])] = make_face(pos, face, tex, ao)
                     counts[face] += 1
                 }
             }

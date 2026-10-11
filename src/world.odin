@@ -7,9 +7,11 @@ import "core:sync"
 import gl "vendor:OpenGL"
 import "core:math/noise"
 
-// TODO: implement biome specific params
-// TODO: seperate rendering
-// TODO: seperate world generation
+//TODO: 
+// implement biome specific params
+// seperate rendering
+// seperate world generation
+// implement column height tracking
 
 COL_HEIGHT :: 16
 MAX_FACES :: C_VOLUME * 3 // * 3 for opaque, * 6 if transparent?
@@ -18,8 +20,6 @@ CMD_CAP :: RENDER_CAP * 6
 
 NEIGHBOUR_DIRS :: [4]ivec2{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
 Column_Heights :: [C_SIZE][C_SIZE]i32
-
-
 
 SEA_HEIGHT :: 64
 SURFACE_HEIGHT :: 20.0 // baseline surface above sea level
@@ -52,6 +52,7 @@ Mesh_Result :: struct {
 }
 
 Column_State :: enum u8 {
+
     Allocated,
     Generated,
     Mesh_Queued,
@@ -242,6 +243,7 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
     gl.UniformMatrix4fv(0, 1, false, &vp[0, 0])
 
     renderer_bind_empty_vao()
+    gl.BindTextureUnit(0, g_block_atlas.handle)
     gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, w.vertex_pool.buffer)
     gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 1, w.data_buffer)
     gl.BindBuffer(gl.DRAW_INDIRECT_BUFFER, w.cmd_buffer)
@@ -388,7 +390,8 @@ get_chunk_unsafe :: proc(world : ^World, pos : ivec3) -> ^Chunk {
 @(private = "file")
 gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     world := cast(^World)user_data
-    column : [COL_HEIGHT]^Chunk
+    column : [COL_HEIGHT]^Chunk 
+    heights : Column_Heights
 
     if world.flatgen {
         max_col_y := (FLATGRASS_HEIGHT / C_SIZE) + 1
@@ -396,12 +399,19 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
             column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
             gen_flat_shape(world, column[i])
         }
+        for x in 0 ..< C_SIZE {
+            for z in 0 ..< C_SIZE {
+                heights[x][z] = FLATGRASS_HEIGHT
+            }
+        }
     } else {
         for i in 0 ..< COL_HEIGHT {
             column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
-            gen_shape(world, column[i])
+            gen_shape(world, column[i], &heights)
         }
     }
+
+    gen_surface(world, &column, &heights)
 
     if column[0] != nil do gen_mantle(world, column[0])
 
@@ -435,8 +445,9 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     }
 }
 
+
 @(private = "file")
-gen_shape :: proc(w : ^World, chunk : ^Chunk) {
+gen_shape :: proc(w : ^World, chunk : ^Chunk, heights : ^Column_Heights) {
 
     vol : Noise_Volume
     noise_vol_fill(
@@ -462,6 +473,7 @@ gen_shape :: proc(w : ^World, chunk : ^Chunk) {
                 d := noise_vol_sample(&vol, x, y, z)
                 if d > 0 {
                     world_set_chunk_block(w, chunk, x, y, z, .Stone)
+                    if heights[x][z] < base_y + y do heights[x][z] = base_y + y
                 }
             }
         }
@@ -486,12 +498,12 @@ gen_flat_shape :: proc(w : ^World, chunk : ^Chunk) {
 gen_surface :: proc(w : ^World, column : ^[COL_HEIGHT]^Chunk, heights : ^Column_Heights) {
     for x in 0 ..< i32(C_SIZE) {
         for z in 0 ..< i32(C_SIZE) {
-            top := heights[x][z] - 1
+            top := heights[x][z]
             if top < 0 do break
 
             chunk := column[top >> C_SHIFT]
             if chunk == nil do continue
-            world_set_chunk_block(w, chunk, x, top & (C_SIZE - 1), z, .Dirt)
+            world_set_chunk_block(w, chunk, x, top & (C_SIZE - 1), z, .Grass)
         }
     }
 }

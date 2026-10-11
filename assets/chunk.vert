@@ -48,7 +48,7 @@ layout(location = 0) uniform mat4 u_vp;
 out vec2 v_uv;
 out flat uint v_face;
 out flat uint v_tex;
-
+out flat uint v_atlas_layer;
 #if QUANTISED_AO == 1
 out flat vec4 ao_corner_v2f;
 #else
@@ -70,7 +70,6 @@ ivec3 get_voxel_pos(uint face, uint corner_index) {
 
 void main () {
     FaceQuad q = quads[gl_VertexID / 6];
-    
     ChunkData chunk_data = per_chunk[gl_BaseInstance];
     ivec3 chunk_pos = ivec3(chunk_data.x, chunk_data.y, chunk_data.z);
 

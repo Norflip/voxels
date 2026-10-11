@@ -80,10 +80,11 @@ main :: proc() {
     defer iml_cleanup()
 
     world : World
-    world_init(&world, 0x123, false)
+    world_init(&world, 0x123, true)
     // defer world_shutdown(&world)
 
     player_init(&g_player, world_get_player_spawn(&world), window)
+    block_init()
 
     fps_frames := 0
     fps_elapsed := 0.0

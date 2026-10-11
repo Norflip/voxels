@@ -12,13 +12,8 @@ const vec3 NORMAL_LOOKUP[6] = {
     vec3( 0,  0, -1)
 };
 
-const vec4 BLOCK_TEST_COLORS[] = {
-    vec4(0.6, 0.6, 0.6, 1.0), // stone
-    vec4(0.35, 0.35, 0.35, 1.0), // mantle
-    vec4(0.671, 0.49, 0.18, 1.0), // dirt
-};
-
 const float dir_shadow_strength = 0.3;
+uniform sampler2DArray u_atlas_sampler;
 
 in vec2 v_uv;
 in flat uint v_face;
@@ -43,15 +38,14 @@ float sample_ao() {
 #endif
 }
 
-vec4 sample_block_color() {
-    return BLOCK_TEST_COLORS[v_tex];
-}
-
 void main() {
     const vec3 sun_dir = normalize(vec3(0.4, 1.0, 0.25));
     const vec3 normal = NORMAL_LOOKUP[v_face];
 
-    vec4 albedo = sample_block_color();
+    vec3 uv = vec3(v_uv, v_tex);
+    vec4 albedo = texture(u_atlas_sampler, uv);
+    if(albedo.a < 0.1) discard;
+
     float ndots = (dot(normal, sun_dir) + 1.0) * 0.5;
     albedo.rgb *= (1.0 - dir_shadow_strength) + (dir_shadow_strength * ndots); // probably wrong? 
 
