@@ -154,6 +154,10 @@ player_orientation :: proc(p : Player) -> m.quat {
     return m.quatAxisAngle(WORLD_UP, p.yaw) * m.quatAxisAngle(LOCAL_RIGHT, p.pitch)
 }
 
+player_world_coord :: #force_inline proc(p : Player) -> ivec3 {
+    return ivec3{i32(p.pos.x), i32(p.pos.y), i32(p.pos.z)}
+}
+
 @(private = "file")
 player_rotate :: proc(p : ^Player, yaw_delta, pitch_delta : f32) {
     max_pitch := m.radians(f32(MAX_PITCH))

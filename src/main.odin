@@ -64,7 +64,7 @@ main :: proc() {
     glfw.SetMouseButtonCallback(window, input_mouse_button_callback)
     glfw.SetKeyCallback(window, input_key_callback)
 
-    //opengl
+    //opengl stuff
     gl.load_up_to(GL_VERSION_MAJOR, GL_VERSION_MINOR, glfw.gl_set_proc_address)
     gl.ClipControl(gl.LOWER_LEFT, gl.ZERO_TO_ONE)
 
@@ -80,7 +80,7 @@ main :: proc() {
     defer iml_cleanup()
 
     world : World
-    world_init(&world, 0x123, true)
+    world_init(&world, 0x123, {})
     // defer world_shutdown(&world)
 
     player_init(&g_player, world_get_player_spawn(&world), window)
@@ -118,9 +118,7 @@ main :: proc() {
         player_tick(&g_player, &world, f32(dt))
         block_interaction(g_player, &world)
 
-
         toff :: #force_inline proc(i : int) -> int {return 10 + 20 * i}
-
         text_area(10, 10, 4, 20)
         textln("voxels")
         textln("%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
@@ -128,7 +126,23 @@ main :: proc() {
         textln("seed: %d", world.seed)
         textln("load radius: %d", world.load_radius)
         textln("frozen: %v", g_is_frozen)
-        textln("player pos: [%v %v %v]", int(g_player.pos.x), int(g_player.pos.y), int(g_player.pos.z))
+
+        pc := player_world_coord(g_player)
+        textln("player pos: %v", pc)
+
+        chunk_l, chunk_local_l := modiv_world_chunk_local(pc)
+        textln("chunk: %v | local: %v", chunk_l, chunk_local_l)
+
+        hunk_l, chunk_hunk_l := modiv_world_hunk_local(pc)
+        textln("hunk: %v | local: %v", hunk_l, chunk_hunk_l)
+        
+        /*
+        textln("== active hunks ==")
+        for hunk_pos, hunk_ptr in world.hunks {
+            textln("\thunk pos: %v | cols count: %d", hunk_pos, hunk_ptr.cols_count)
+        }
+        */
+
         textln("--------------------------------")
         textln("m total allocated: %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_allocated, g_tracking_allocator.total_memory_allocated / 1024, g_tracking_allocator.total_memory_allocated / (1024 * 1024))
         textln("m total freed:     %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_freed, g_tracking_allocator.total_memory_freed / 1024, g_tracking_allocator.total_memory_freed / (1024 * 1024))
@@ -142,7 +156,7 @@ main :: proc() {
             f32(world.vertex_pool.page_count - world.vertex_pool.free_pages) / f32(world.vertex_pool.page_count) * 100,
         )
 
-        if renderer_begin_frame(g_player.camera) {
+        if renderer_begin_frame(g_player.camera, f32(dt)) {
             face_count := world_render(&world, g_player.camera, g_is_frozen ? g_frozen_cam : g_player.camera, draw_lines = true)
             textln("face count: %d", face_count)
             textln("chunk count: %d", world.chunk_count)

@@ -100,6 +100,7 @@ chunk_mark_mesh_dirty :: proc "contextless" (chunk : ^Chunk) -> bool {
 
 chunk_clear_mesh_dirty :: proc "contextless" (chunk : ^Chunk) {
     intrinsics.atomic_store(&chunk.dirty, false)
+
 }
 
 chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> (total : u32, counts : [6]u32) {

@@ -7,6 +7,7 @@ ivec3 :: [3]i32
 vec3 :: [3]f32
 vec4 :: [4]f32
 mat4 :: matrix[4, 4]f32
+mat3 :: matrix[3, 3]f32
 
 RED :: u32(0xFF0000FF)
 GREEN :: u32(0x00FF00FF)
@@ -20,4 +21,3 @@ create_mapped_buffer :: proc(buffer : ^u32, size : u32, storage_flags : u32, map
     when ODIN_DEBUG do gl.ObjectLabel(gl.BUFFER, buffer^, -1, label)
     return ([^]T)(mapped)
 }
-

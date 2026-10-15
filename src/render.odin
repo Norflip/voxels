@@ -17,6 +17,8 @@ FONT_TEX_HEIGHT :: FONT_TEX_ROWS * FONT_HEIGHT
 
 UI_MAX_QUADS :: 8 * 1024
 
+SUN_ROTATION_SPEED :: 0.02
+
 Glyph_Quad :: struct #packed {
     pos_rect : vec4,
     uv_rect :  vec4,
@@ -48,7 +50,9 @@ _ctx : struct {
 
     //
     skybox_program :     u32,
-
+    sun_local_roll :     f32,
+    sun_local_yaw :      f32,
+    sun_orbit_axis :     math.quat,
 
     // quad rendering
     program :            u32,
@@ -89,6 +93,7 @@ renderer_init :: proc(backbuffer_width, backbuffer_height : i32) -> bool {
         return false
     }
 
+    _ctx.sun_orbit_axis = math.quatAxisAngle({1, 0, 0}, f32(math.PI * 0.25)) * math.quatAxisAngle({0, 1, 0}, f32(math.PI * 0.75))
     _ctx.initialized = true
     renderer_resize(backbuffer_width, backbuffer_height)
 
@@ -120,7 +125,7 @@ renderer_resize :: proc(backbuffer_width, backbuffer_height : i32) {
     _ctx.target = rt_create(backbuffer_width, backbuffer_height)
 }
 
-renderer_begin_frame :: proc(cam : Camera) -> bool {
+renderer_begin_frame :: proc(cam : Camera, dt : f32) -> bool {
     assert(_ctx.initialized, "renderer_begin_frame called before renderer_init")
     assert(!_ctx.in_frame, "renderer_begin_frame called twice without renderer_end_frame")
 
@@ -143,6 +148,11 @@ renderer_begin_frame :: proc(cam : Camera) -> bool {
     // no need if we are rendering a skybox on top
     //gl.ClearNamedFramebufferfv(_ctx.target.framebuffer, gl.COLOR, 0, &color[0])
 
+    _ctx.sun_local_roll += dt * SUN_ROTATION_SPEED
+    _ctx.sun_local_roll = math.mod(_ctx.sun_local_roll, math.TAU)
+    _ctx.sun_local_yaw += dt * SUN_ROTATION_SPEED * 0.5
+    _ctx.sun_local_yaw = math.mod(_ctx.sun_local_yaw, math.TAU)
+
     _ctx.in_frame = true
     return true
 }
@@ -164,6 +174,12 @@ renderer_end_frame :: proc() {
         view := g_active_camera.view
         gl.UniformMatrix4fv(0, 1, gl.FALSE, raw_data(&inv_proj))
         gl.UniformMatrix4fv(1, 1, gl.FALSE, raw_data(&view))
+
+        orbit_axis := cast(mat3)math.mat4FromQuat(math.normalize(_ctx.sun_orbit_axis))
+        spin := math.quatAxisAngle({0, 1, 0}, _ctx.sun_local_yaw) * math.quatAxisAngle({1, 0, 1}, _ctx.sun_local_roll)
+        sun_to_local := math.transpose(orbit_axis * cast(mat3)math.mat4FromQuat(math.normalize(spin)))
+        gl.UniformMatrix3fv(2, 1, false, raw_data(&orbit_axis))
+        gl.UniformMatrix3fv(3, 1, false, raw_data(&sun_to_local))
 
         gl.DrawArrays(gl.TRIANGLES, 0, 3)
         gl.DepthMask(true)
@@ -193,6 +209,10 @@ renderer_end_frame :: proc() {
 
 renderer_can_render :: proc() -> bool {
     return _ctx.in_frame
+}
+
+renderer_sun_mat :: proc() -> mat3 {
+    return cast(mat3)math.mat4FromQuat(_ctx.sun_orbit_axis)
 }
 
 renderer_assert_can_render :: proc(loc := #caller_location) {
