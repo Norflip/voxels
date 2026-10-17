@@ -18,22 +18,6 @@ RENDER_CAP :: 4096
 CMD_CAP :: RENDER_CAP * 6
 
 NEIGHBOUR_DIRS :: [4]ivec2{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
-Column_Heights :: [C_SIZE][C_SIZE]i32
-
-SEA_HEIGHT :: 64
-SURFACE_HEIGHT :: 20.0 // baseline surface above sea level
-FLATGRASS_HEIGHT :: 20
-SQUASH :: 0.8
-
-// continental
-CONT_OCTAVE :: 4
-CONT_FREQ :: 1.0 / 700.0 // broad surface shape
-CONT_AMP :: 28.0 // how much the surface rolls
-
-// 3D density carve
-DENSE_OCTAVE :: 4
-DENSE_FREQ :: 1.0 / 110.0
-DENSE_AMP :: 10.0
 
 H_SIZE :: 16
 H_SHIFT :: 4
@@ -43,13 +27,23 @@ H_WSIZE :: H_SIZE * C_SIZE
 H_WSHIFT :: H_SHIFT + C_SHIFT
 H_WAREA :: H_WSIZE * H_WSIZE
 
-@(private = "file")
+CLIMATE_JUMP :: 16
+CLIMATE_STEPS :: H_WSIZE / CLIMATE_JUMP + 1
+Climate_Noise :: Noise_Area(H_WSIZE, CLIMATE_JUMP)
+
 Hunk :: struct {
-    pos :     ivec2,
-    mu :      sync.RW_Mutex,
-    columns : [H_AREA]Column_State,
-    chunks :  [H_AREA][H_SIZE]^Chunk,
-    cols_count :   u32,
+    pos :         ivec2,
+    mu :          sync.RW_Mutex,
+    columns :     [H_AREA]Column_State,
+    chunks :      [H_AREA][H_SIZE]^Chunk,
+    cols_count :  u32,
+    heightmap :   [H_WAREA]i16,
+
+    // readonly stuff
+    cont :        Climate_Noise,
+    temperature : Climate_Noise,
+    rain :        Climate_Noise,
+    biomes :      [CLIMATE_STEPS * CLIMATE_STEPS]Biome,
 }
 
 @(private = "file")
@@ -94,7 +88,7 @@ World :: struct {
     load_center :     [2]i32,
     seed :            i64,
     flags :           World_Flags,
-
+    biome_scale :     f64,
     // rendering
     chunk_count :     u32,
     cmd_count :       u32,
@@ -116,21 +110,19 @@ world_init :: proc(w : ^World, seed : i64, flags : World_Flags = {}) {
     }
 
     w.vp_loc = gl.GetUniformLocation(w.chunk_program, "u_vp")
-    //w.chunks = make(map[ivec3]^Chunk, context.allocator)
-    //w.columns = make(map[ivec2]Column_State, context.allocator)
     w.hunks = make(map[ivec2]^Hunk, context.allocator)
     w.exiting = false
-    w.load_radius = 3
-    w.load_center = [2]i32{2, 2}
+    w.load_radius = 6
+    w.load_center = [2]i32{1, 1}
     w.seed = seed
     w.flags = flags
+    w.biome_scale = 0.8
     queue.init(&w.mesh_results, allocator = context.allocator)
 
     storage_flags : u32 = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT
     mapping_flags : u32 = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT | gl.MAP_FLUSH_EXPLICIT_BIT
     w.cmds = create_mapped_buffer(&w.cmd_buffer, CMD_CAP, storage_flags, mapping_flags, "Chunk_Batch_cmd_buf", gl.DrawArraysIndirectCommand)
     w.data = create_mapped_buffer(&w.data_buffer, RENDER_CAP, storage_flags, mapping_flags, "Chunk_Batch_data_buf", Per_Chunk_Data)
-    //vertex_arena_init(&w.vertex_arena, 16 * mem.Megabyte)
     vertex_pool_init(&w.vertex_pool, 16 * mem.Megabyte, 256, context.allocator)
 
     MESH_SCRATCH_SIZE :: MAX_FACES * size_of(Chunk_Face)
@@ -149,10 +141,10 @@ load_init_chunks :: proc(w : ^World) {
     if .No_Ring not_in w.flags do radius += 1
 
     size := 1 + int(radius) * 2
+
     center := w.load_center
     min_hunk, _ := modiv_chunk_hunk_local(ivec3{center.x - radius, 0, center.y - radius})
     max_hunk, _ := modiv_chunk_hunk_local(ivec3{center.x + radius, 0, center.y + radius})
-
     for hunk_x := min_hunk.x; hunk_x <= max_hunk.x; hunk_x += 1 {
         for hunk_z := min_hunk.z; hunk_z <= max_hunk.z; hunk_z += 1 {
             try_create_hunk(w, hunk_x, hunk_z)
@@ -176,12 +168,13 @@ load_init_chunks :: proc(w : ^World) {
 
 @(private = "file")
 try_create_hunk :: proc(w : ^World, hunk_x, hunk_z : i32) -> bool {
-
     key := ivec2{hunk_x, hunk_z}
     if _, exists := w.hunks[key]; exists do return false
 
     hunk := new(Hunk, context.allocator)
     hunk.pos = key
+    for &h in hunk.heightmap do h = -1 // no data
+    hunk_gen_climate(w, hunk)
     w.hunks[key] = hunk
 
     fmt.printf("initializing hunk at (%v, %v)\n", hunk_x, hunk_z)
@@ -201,18 +194,10 @@ load_column :: proc(w : ^World, col : ivec2) {
         chunk_init(chunk, ivec3{col.x, i32(i), col.y}, context.allocator)
         hunk.chunks[idx][i] = chunk
     }
-    
+
     hunk.columns[idx] = .Allocated
     intrinsics.atomic_add(&hunk.cols_count, 1)
     worker_push(&w.gen_thread, col)
-}
-
-world_set_block :: proc(w : ^World, pos : ivec3, block : Block) -> bool {
-    sync.rw_mutex_shared_guard(&w.hunks_mu)
-    chunk_pos, local_pos := modiv_world_chunk_local(pos)
-    chunk := get_chunk_unsafe(w, chunk_pos)
-    if chunk == nil do return false
-    return set_block_internal(w, chunk, local_pos.x, local_pos.y, local_pos.z, block)
 }
 
 world_get_block :: proc(w : ^World, pos : ivec3) -> Block {
@@ -223,12 +208,52 @@ world_get_block :: proc(w : ^World, pos : ivec3) -> Block {
     return chunk_get_block(chunk, local_pos.x, local_pos.y, local_pos.z)
 }
 
-world_set_chunk_block :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
+// Generation path: skips the heightmap, gen_thread_proc stores whole columns of heights at once.
+gen_set_block :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
     if chunk == nil do return false
     sync.rw_mutex_shared_guard(&w.hunks_mu)
     return set_block_internal(w, chunk, x, y, z, block)
 }
 
+world_set_block :: proc(w : ^World, pos : ivec3, block : Block) -> bool {
+    sync.rw_mutex_shared_guard(&w.hunks_mu)
+    chunk_pos, local_pos := modiv_world_chunk_local(pos)
+    chunk := get_chunk_unsafe(w, chunk_pos)
+    if chunk == nil do return false
+    if !set_block_internal(w, chunk, local_pos.x, local_pos.y, local_pos.z, block) do return false
+    update_height_unsafe(w, pos, block)
+    return true
+}
+
+world_set_chunk_block :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
+    if chunk == nil do return false
+    sync.rw_mutex_shared_guard(&w.hunks_mu)
+    if !set_block_internal(w, chunk, x, y, z, block) do return false
+    update_height_unsafe(w, chunk.pos * C_SIZE + ivec3{x, y, z}, block)
+    return true
+}
+
+world_get_height :: proc(w : ^World, x, z : i32) -> (height : i32, ok : bool) {
+    sync.rw_mutex_shared_guard(&w.hunks_mu)
+    key, local := modiv_world_hunk_local(ivec3{x, 0, z})
+    hunk := w.hunks[key]
+    if hunk == nil do return -1, false
+    height = i32(intrinsics.atomic_load_explicit(&hunk.heightmap[local.z * H_WSIZE + local.x], .Relaxed))
+    return height, height >= 0
+}
+
+// biome of the nearest climate sample
+world_get_biome :: proc(w : ^World, x, z : i32) -> (biome : Biome, ok : bool) {
+    sync.rw_mutex_shared_guard(&w.hunks_mu)
+    key, local := modiv_world_hunk_local(ivec3{x, 0, z})
+    hunk := w.hunks[key]
+    if hunk == nil do return .Plains, false
+    ix := (local.x + CLIMATE_JUMP / 2) / CLIMATE_JUMP
+    iz := (local.z + CLIMATE_JUMP / 2) / CLIMATE_JUMP
+    return hunk.biomes[iz * CLIMATE_STEPS + ix], true
+}
+
+//TODO: come up with a better name for these kinds of procs
 modiv_world_chunk_local :: #force_inline proc(pos : ivec3) -> (chunk, local : ivec3) {
     chunk = {pos.x >> C_SHIFT, pos.y >> C_SHIFT, pos.z >> C_SHIFT}
     local = pos & (C_SIZE - 1)
@@ -272,46 +297,32 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
 
     renderer_group("world_render")
 
-    sync.rw_mutex_shared_lock(&w.hunks_mu)
-
-    // handle mesh results
-    sync.mutex_lock(&w.mesh_results_mu)
-    for result in queue.pop_front_safe(&w.mesh_results) {
-        chunk := get_chunk_unsafe(w, result.loc)
-        if chunk == nil {
-            vertex_pool_free(&w.vertex_pool, result.handle)
-            continue
-        }
-        if result.handle.count > 0 do vertex_pool_publish(&w.vertex_pool, result.handle)
-        vertex_pool_free(&w.vertex_pool, chunk.handle)
-        chunk.handle = result.handle
-        chunk.face_counts = result.face_counts
-    }
-    sync.mutex_unlock(&w.mesh_results_mu)
-
-    // commit to gpu
-    vertex_pool_commit(&w.vertex_pool)
-
-    // collect chunks
     w.cmd_count = 0
     w.chunk_count = 0
     face_count : u32 = 0
 
-    for _, hunk in w.hunks {
-        sync.rw_mutex_shared_lock(&hunk.mu)
-        for col in 0 ..< H_AREA {
-            if hunk.columns[col] == .Unloaded do continue
-            for chunk in hunk.chunks[col] {
-                face_count += push_chunk_for_render(w, chunk, cull_cam)
+    sync.rw_mutex_shared_lock(&w.hunks_mu)
+    {
+        handle_mesh_results(w)
+        vertex_pool_commit(&w.vertex_pool)
 
-                if draw_lines && chunk.blocks != nil {
-                    min_pos := chunk.pos * C_SIZE
-                    max_pos := min_pos + ivec3{C_SIZE, C_SIZE, C_SIZE}
-                    iml_bounds(vec3(min_pos), vec3(max_pos), 0xFFFFFF1E)
+        for _, hunk in w.hunks {
+            sync.rw_mutex_shared_lock(&hunk.mu)
+            for col in 0 ..< H_AREA {
+                if hunk.columns[col] == .Unloaded do continue
+                for chunk in hunk.chunks[col] {
+                    fc := push_chunk_for_render(w, chunk, cull_cam)
+                    face_count += fc
+
+                    if fc > 0 && draw_lines && chunk.blocks != nil {
+                        min_pos := chunk.pos * C_SIZE
+                        max_pos := min_pos + ivec3{C_SIZE, C_SIZE, C_SIZE}
+                        iml_bounds(vec3(min_pos), vec3(max_pos), 0xFFFFFF1E)
+                    }
                 }
             }
+            sync.rw_mutex_shared_unlock(&hunk.mu)
         }
-        sync.rw_mutex_shared_unlock(&hunk.mu)
     }
     sync.rw_mutex_shared_unlock(&w.hunks_mu)
 
@@ -339,6 +350,24 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
     gl.MultiDrawArraysIndirect(gl.TRIANGLES, nil, i32(w.cmd_count), 0)
 
     return face_count
+}
+
+@(private = "file")
+handle_mesh_results :: proc(w : ^World) {
+    sync.mutex_guard(&w.mesh_results_mu)
+
+    for result in queue.pop_front_safe(&w.mesh_results) {
+        chunk := get_chunk_unsafe(w, result.loc)
+        if chunk == nil {
+            vertex_pool_free(&w.vertex_pool, result.handle)
+            continue
+        }
+
+        if result.handle.count > 0 do vertex_pool_publish(&w.vertex_pool, result.handle)
+        vertex_pool_free(&w.vertex_pool, chunk.handle)
+        chunk.handle = result.handle
+        chunk.face_counts = result.face_counts
+    }
 }
 
 /*
@@ -409,12 +438,8 @@ push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (face
 @(private = "file")
 set_block_internal :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
     if chunk == nil do return false
-
-    did_set := chunk_set_block(chunk, x, y, z, block)
-    if !did_set do return false
-
+    if !chunk_set_block(chunk, x, y, z, block) do return false
     mark_chunk_dirty(w, chunk)
-    // try_set_height(w, wpos, block)
 
     if x == 0 || x == C_SIZE - 1 || y == 0 || y == C_SIZE - 1 || z == 0 || z == C_SIZE - 1 {
         if x == 0 {
@@ -453,6 +478,57 @@ set_block_internal :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Bl
 }
 
 @(private = "file")
+update_height_unsafe :: proc(w : ^World, wpos : ivec3, block : Block) {
+    key, local := modiv_world_hunk_local(wpos)
+    hunk := w.hunks[key]
+    if hunk == nil do return
+    h := &hunk.heightmap[local.z * H_WSIZE + local.x]
+    top := i32(intrinsics.atomic_load_explicit(h, .Relaxed))
+
+    if block_is_solid(block) {
+        if wpos.y > top do intrinsics.atomic_store_explicit(h, i16(wpos.y), .Relaxed)
+        return
+    }
+    if wpos.y != top do return
+
+    lx := wpos.x & (C_SIZE - 1)
+    lz := wpos.z & (C_SIZE - 1)
+    new_top : i32 = -1
+    y := wpos.y - 1
+    scan: for y >= 0 {
+        chunk_base := (y >> C_SHIFT) << C_SHIFT
+        chunk := get_chunk_unsafe(w, ivec3{wpos.x >> C_SHIFT, y >> C_SHIFT, wpos.z >> C_SHIFT})
+        if chunk != nil && chunk.num_filled > 0 {
+            for ly := y - chunk_base; ly >= 0; ly -= 1 {
+                if block_is_solid(chunk_get_block(chunk, lx, ly, lz)) {
+                    new_top = chunk_base + ly
+                    break scan
+                }
+            }
+        }
+        y = chunk_base - 1
+    }
+    intrinsics.atomic_store_explicit(h, i16(new_top), .Relaxed)
+}
+
+@(private = "file")
+store_column_heights :: proc(w : ^World, loc : ivec2, heights : ^Column_Heights) {
+    sync.rw_mutex_shared_guard(&w.hunks_mu)
+    key, _ := hunk_column_index(loc)
+    hunk := w.hunks[key]
+    if hunk == nil do return
+
+    base_x := (loc.x & (H_SIZE - 1)) * C_SIZE
+    base_z := (loc.y & (H_SIZE - 1)) * C_SIZE
+    for z in 0 ..< i32(C_SIZE) {
+        row := (base_z + z) * H_WSIZE + base_x
+        for x in 0 ..< i32(C_SIZE) {
+            intrinsics.atomic_store_explicit(&hunk.heightmap[row + x], i16(heights[x][z]), .Relaxed)
+        }
+    }
+}
+
+@(private = "file")
 mark_chunk_dirty :: proc(w : ^World, chunk : ^Chunk) {
     if !chunk_mark_mesh_dirty(chunk) do return
 
@@ -460,7 +536,6 @@ mark_chunk_dirty :: proc(w : ^World, chunk : ^Chunk) {
     worker_push(&w.mesh_thread, chunk.pos)
 }
 
-@(private = "file")
 get_chunk :: proc(w : ^World, pos : ivec3) -> ^Chunk {
     sync.rw_mutex_shared_guard(&w.hunks_mu)
     return get_chunk_unsafe(w, pos)
@@ -479,29 +554,10 @@ get_chunk_unsafe :: proc(w : ^World, pos : ivec3) -> ^Chunk {
 @(private = "file")
 gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     world := cast(^World)user_data
-    column : [H_SIZE]^Chunk
+
     heights : Column_Heights
-
-    if .Gen_Flat in world.flags {
-        max_col_y := (FLATGRASS_HEIGHT / C_SIZE) + 1
-        for i in 0 ..< max_col_y {
-            column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
-            gen_flat_shape(world, column[i])
-        }
-        for x in 0 ..< C_SIZE {
-            for z in 0 ..< C_SIZE {
-                heights[x][z] = FLATGRASS_HEIGHT
-            }
-        }
-    } else {
-        for i in 0 ..< H_SIZE {
-            column[i] = get_chunk(world, ivec3{loc.x, i32(i), loc.y})
-            gen_shape(world, column[i], &heights)
-        }
-    }
-
-    gen_surface(world, &column, &heights)
-    if column[0] != nil do gen_mantle(world, column[0])
+    gen_column(world, loc, &heights)
+    store_column_heights(world, loc, &heights)
 
     ready : [5]ivec2
     ready_count := 0
@@ -555,81 +611,9 @@ column_neighbours_generated_unsafe :: proc(w : ^World, loc : ivec2) -> bool {
 }
 
 @(private = "file")
-gen_shape :: proc(w : ^World, chunk : ^Chunk, heights : ^Column_Heights) {
-
-    vol : Noise_Volume
-    noise_vol_fill(
-        &vol,
-        w.seed,
-        chunk.pos * C_SIZE,
-        proc(seed : i64, wx, wy, wz : f64, ctx : rawptr) -> f64 {
-            cont := noise_fbm(seed + 0x44, wx, wz, CONT_OCTAVE, CONT_FREQ) // fbm returns [-1,1]
-            cont *= CONT_AMP
-
-            carve := noise_fbm(seed + 0x11, wx, wy, wz, DENSE_OCTAVE, DENSE_FREQ)
-            carve *= DENSE_AMP
-
-            surface := f64(SEA_HEIGHT) + SURFACE_HEIGHT + cont
-            return carve + (surface - wy) * SQUASH
-        },
-    )
-
-    base_y := chunk.pos.y * C_SIZE
-    for x in 0 ..< i32(C_SIZE) {
-        for z in 0 ..< i32(C_SIZE) {
-            for y : i32 = C_SIZE - 1; y >= 0; y -= 1 {
-                d := noise_vol_sample(&vol, x, y, z)
-                if d > 0 {
-                    world_set_chunk_block(w, chunk, x, y, z, .Stone)
-                    if heights[x][z] < base_y + y do heights[x][z] = base_y + y
-                }
-            }
-        }
-    }
-}
-
-@(private = "file")
-gen_flat_shape :: proc(w : ^World, chunk : ^Chunk) {
-    base_y := chunk.pos.y * C_SIZE
-    for x in 0 ..< i32(C_SIZE) {
-        for z in 0 ..< i32(C_SIZE) {
-            for y : i32 = C_SIZE - 1; y >= 0; y -= 1 {
-                world_y := base_y + y
-                if world_y > FLATGRASS_HEIGHT do continue
-                world_set_chunk_block(w, chunk, x, y, z, .Stone)
-            }
-        }
-    }
-}
-
-@(private = "file")
-gen_surface :: proc(w : ^World, column : ^[H_SIZE]^Chunk, heights : ^Column_Heights) {
-    for x in 0 ..< i32(C_SIZE) {
-        for z in 0 ..< i32(C_SIZE) {
-            top := heights[x][z]
-            if top < 0 do continue
-
-            chunk := column[top >> C_SHIFT]
-            if chunk == nil do continue
-            world_set_chunk_block(w, chunk, x, top & (C_SIZE - 1), z, .Grass)
-        }
-    }
-}
-
-@(private = "file")
-gen_mantle :: proc(w : ^World, bottom : ^Chunk) {
-    assert(bottom.pos.y == 0)
-    for x in 0 ..< i32(C_SIZE) {
-        for z in 0 ..< i32(C_SIZE) {
-            world_set_chunk_block(w, bottom, x, 0, z, .Mantle)
-        }
-    }
-}
-
-@(private = "file")
-should_mesh :: proc(w : ^World, chunk : ^Chunk) -> bool {
-    d := ivec2{chunk.pos.x, chunk.pos.z} - w.load_center
-    return math.abs_i32(d.x) <= w.load_radius && math.abs_i32(d.y) <= w.load_radius
+should_mesh :: proc(load_radius : i32, center : [2]i32, chunk : ^Chunk) -> bool {
+    d := ivec2{chunk.pos.x, chunk.pos.z} - center
+    return math.abs_i32(d.x) <= load_radius && math.abs_i32(d.y) <= load_radius
 }
 
 @(private = "file")
@@ -639,7 +623,7 @@ mesh_thread_proc :: proc(loc : ivec3, scratch : mem.Allocator, user_data : rawpt
     chunk := get_chunk_unsafe(w, loc)
     if chunk == nil do return
 
-    if !should_mesh(w, chunk) do return
+    if !should_mesh(w.load_radius, w.load_center, chunk) do return
 
     chunk_clear_mesh_dirty(chunk)
 

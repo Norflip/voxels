@@ -118,8 +118,7 @@ main :: proc() {
         player_tick(&g_player, &world, f32(dt))
         block_interaction(g_player, &world)
 
-        toff :: #force_inline proc(i : int) -> int {return 10 + 20 * i}
-        text_area(10, 10, 4, 20)
+        text_area(10, 10, 4, 16)
         textln("voxels")
         textln("%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
         textln("--------------------------------")
@@ -135,13 +134,15 @@ main :: proc() {
 
         hunk_l, chunk_hunk_l := modiv_world_hunk_local(pc)
         textln("hunk: %v | local: %v", hunk_l, chunk_hunk_l)
-        
-        /*
+
         textln("== active hunks ==")
         for hunk_pos, hunk_ptr in world.hunks {
             textln("\thunk pos: %v | cols count: %d", hunk_pos, hunk_ptr.cols_count)
         }
-        */
+
+        biome, bok := world_get_biome(&world, pc.x, pc.z)
+        textln("biome: %v | ok: %v", biome, bok)
+
 
         textln("--------------------------------")
         textln("m total allocated: %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_allocated, g_tracking_allocator.total_memory_allocated / 1024, g_tracking_allocator.total_memory_allocated / (1024 * 1024))
@@ -156,16 +157,27 @@ main :: proc() {
             f32(world.vertex_pool.page_count - world.vertex_pool.free_pages) / f32(world.vertex_pool.page_count) * 100,
         )
 
+        /*
+    // heightmap test
+        HEIGHTMAP_RADIUS :: 12
+        for hz := -HEIGHTMAP_RADIUS; hz <= HEIGHTMAP_RADIUS; hz += 1 {
+            for hx := -HEIGHTMAP_RADIUS; hx <= HEIGHTMAP_RADIUS; hx += 1 {
+                hx_world := pc.x + i32(hx)
+                hz_world := pc.z + i32(hz)
+                height, hok := world_get_height(&world, hx_world, hz_world)
+                if hok {
+                    pos := vec3{f32(hx_world), f32(height) + 0.5 + 0.2, f32(hz_world)} + 0.5
+                    iml_box(pos, vec3{0.15, 0.15, 0.15}, RED)
+                }
+            }
+        }
+*/
         if renderer_begin_frame(g_player.camera, f32(dt)) {
             face_count := world_render(&world, g_player.camera, g_is_frozen ? g_frozen_cam : g_player.camera, draw_lines = true)
             textln("face count: %d", face_count)
             textln("chunk count: %d", world.chunk_count)
 
-            if g_is_frozen {
-                iml_frustum(g_frozen_cam, 0xFF0000FF)
-            }
-
-
+            if g_is_frozen do iml_frustum(g_frozen_cam, 0xFF0000FF)
             if g_draw_lines {
                 iml_render(g_player.camera.view_proj)
             } else {
@@ -263,7 +275,7 @@ input_key_callback :: proc "c" (window : glfw.WindowHandle, key, scancode, actio
     if (key == glfw.KEY_F1 && action == glfw.PRESS) {
         g_is_frozen = !g_is_frozen
         if g_is_frozen {
-            g_frozen_cam = camera_snapshot(g_player.camera)
+            g_frozen_cam = g_player.camera
         }
     }
 

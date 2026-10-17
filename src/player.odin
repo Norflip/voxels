@@ -9,10 +9,9 @@ FOV :: 90.0
 MAX_PITCH :: 89.9
 MOUSE_SENSITIVITY :: 0.05
 
+WORLD_RIGHT :: vec3{1, 0, 0}
 WORLD_UP :: vec3{0, 1, 0}
-LOCAL_FORWARD :: vec3{0, 0, -1}
-LOCAL_RIGHT :: vec3{1, 0, 0}
-
+WORLD_FORWARD :: vec3{0, 0, -1}
 
 // Plain value type, no owned memory. Safe to copy freely.
 Camera :: struct {
@@ -69,16 +68,12 @@ camera_resize :: proc(c : ^Camera, width, height : int) {
     c.dirty = true
 }
 
-camera_snapshot :: proc "contextless" (c : Camera) -> Camera {
-    return c
+camera_forward :: #force_inline proc(c : Camera) -> vec3 {
+    return m.quatMulVec3(c.orientation, WORLD_FORWARD)
 }
 
-camera_forward :: proc(c : Camera) -> vec3 {
-    return m.quatMulVec3(c.orientation, LOCAL_FORWARD)
-}
-
-camera_right :: proc(c : Camera) -> vec3 {
-    return m.quatMulVec3(c.orientation, LOCAL_RIGHT)
+camera_right :: #force_inline proc(c : Camera) -> vec3 {
+    return m.quatMulVec3(c.orientation, WORLD_RIGHT)
 }
 
 camera_get_ray :: proc(c : Camera, x, y : f64) -> (origin, dir : vec3, ok : bool) {
@@ -151,7 +146,7 @@ player_tick :: proc(p : ^Player, world : ^World, delta_time : f32) {
 }
 
 player_orientation :: proc(p : Player) -> m.quat {
-    return m.quatAxisAngle(WORLD_UP, p.yaw) * m.quatAxisAngle(LOCAL_RIGHT, p.pitch)
+    return m.quatAxisAngle(WORLD_UP, p.yaw) * m.quatAxisAngle(WORLD_RIGHT, p.pitch)
 }
 
 player_world_coord :: #force_inline proc(p : Player) -> ivec3 {
@@ -202,8 +197,8 @@ update_input :: proc(p : ^Player, dt : f32) -> (changed : bool) {
     speed := glfw.GetKey(p.window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS ? p.speed * 5 : p.speed
     if xt != 0 || yt != 0 || zt != 0 {
         orientation := player_orientation(p^)
-        forward := m.quatMulVec3(orientation, LOCAL_FORWARD)
-        right := m.quatMulVec3(orientation, LOCAL_RIGHT)
+        forward := m.quatMulVec3(orientation, WORLD_FORWARD)
+        right := m.quatMulVec3(orientation, WORLD_RIGHT)
         dir := m.normalize(vec3{xt, yt, zt})
         p.pos += (right * dir.x + WORLD_UP * dir.y + forward * dir.z) * speed * dt
         changed = true
