@@ -16,6 +16,7 @@ import gl "vendor:OpenGL"
 MAX_FACES :: C_VOLUME * 3 // * 3 for opaque, * 6 if transparent?
 RENDER_CAP :: 4096
 CMD_CAP :: RENDER_CAP * 6
+FRAMES_IN_FLIGHT :: 3
 
 NEIGHBOUR_DIRS :: [4]ivec2{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
 
@@ -89,13 +90,17 @@ World :: struct {
     seed :            i64,
     flags :           World_Flags,
     biome_scale :     f64,
+
     // rendering
     chunk_count :     u32,
     cmd_count :       u32,
-    cmds :            [^]gl.DrawArraysIndirectCommand,
-    data :            [^]Per_Chunk_Data,
+    cmds :            [^]gl.DrawArraysIndirectCommand, // FRAMES_IN_FLIGHT slots of CMD_CAP
+    data :            [^]Per_Chunk_Data, // FRAMES_IN_FLIGHT slots of data_stride
     cmd_buffer :      u32,
     data_buffer :     u32,
+    data_stride :     u32, // elements per data slot, SSBO offset aligned
+    frame :           u32, // slot being written this frame
+    fences :          [FRAMES_IN_FLIGHT]gl.sync_t,
     vertex_pool :     Vertex_Pool(Chunk_Face),
     chunk_program :   u32,
     vp_loc :          i32,
@@ -119,10 +124,15 @@ world_init :: proc(w : ^World, seed : i64, flags : World_Flags = {}) {
     w.biome_scale = 0.8
     queue.init(&w.mesh_results, allocator = context.allocator)
 
+    ssbo_align : i32
+    gl.GetIntegerv(gl.SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &ssbo_align)
+    data_bytes := mem.align_forward_int(RENDER_CAP * size_of(Per_Chunk_Data), max(int(ssbo_align), size_of(Per_Chunk_Data)))
+    w.data_stride = u32(data_bytes / size_of(Per_Chunk_Data))
+
     storage_flags : u32 = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT
     mapping_flags : u32 = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT | gl.MAP_FLUSH_EXPLICIT_BIT
-    w.cmds = create_mapped_buffer(&w.cmd_buffer, CMD_CAP, storage_flags, mapping_flags, "Chunk_Batch_cmd_buf", gl.DrawArraysIndirectCommand)
-    w.data = create_mapped_buffer(&w.data_buffer, RENDER_CAP, storage_flags, mapping_flags, "Chunk_Batch_data_buf", Per_Chunk_Data)
+    w.cmds = create_mapped_buffer(&w.cmd_buffer, CMD_CAP * FRAMES_IN_FLIGHT, storage_flags, mapping_flags, "Chunk_Batch_cmd_buf", gl.DrawArraysIndirectCommand)
+    w.data = create_mapped_buffer(&w.data_buffer, w.data_stride * FRAMES_IN_FLIGHT, storage_flags, mapping_flags, "Chunk_Batch_data_buf", Per_Chunk_Data)
     vertex_pool_init(&w.vertex_pool, 16 * mem.Megabyte, 256, context.allocator)
 
     MESH_SCRATCH_SIZE :: MAX_FACES * size_of(Chunk_Face)
@@ -287,6 +297,7 @@ world_get_player_spawn :: proc(w : ^World) -> vec3 {
 world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : bool = false) -> u32 {
 
     // hunk bounds
+    /*
     if draw_lines {
         for key, hunk in w.hunks {
             min_pos := ivec3{key.x << H_WSHIFT, 0, key.y << H_WSHIFT}
@@ -294,8 +305,10 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
             iml_bounds(vec3(min_pos), vec3(max_pos), 0xFF0000FF)
         }
     }
+    */
 
     renderer_group("world_render")
+    wait_frame_fence(w)
 
     w.cmd_count = 0
     w.chunk_count = 0
@@ -326,29 +339,36 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
     }
     sync.rw_mutex_shared_unlock(&w.hunks_mu)
 
-    if w.cmd_count == 0 do return 0
+    if w.cmd_count > 0 {
+        cmd_offset := int(w.frame * CMD_CAP) * size_of(gl.DrawArraysIndirectCommand)
+        data_offset := int(w.frame * w.data_stride) * size_of(Per_Chunk_Data)
+        data_size := int(w.chunk_count) * size_of(Per_Chunk_Data)
 
-    gl.FlushMappedNamedBufferRange(w.cmd_buffer, 0, int(w.cmd_count) * size_of(gl.DrawArraysIndirectCommand))
-    gl.FlushMappedNamedBufferRange(w.data_buffer, 0, int(w.chunk_count) * size_of(Per_Chunk_Data))
+        gl.FlushMappedNamedBufferRange(w.cmd_buffer, cmd_offset, int(w.cmd_count) * size_of(gl.DrawArraysIndirectCommand))
+        gl.FlushMappedNamedBufferRange(w.data_buffer, data_offset, data_size)
 
-    gl.Enable(gl.DEPTH_TEST)
-    gl.Enable(gl.CULL_FACE)
-    gl.CullFace(gl.BACK)
-    gl.UseProgram(w.chunk_program)
+        gl.Enable(gl.DEPTH_TEST)
+        gl.Enable(gl.CULL_FACE)
+        gl.CullFace(gl.BACK)
+        gl.UseProgram(w.chunk_program)
 
-    vp := cam.view_proj
-    gl.UniformMatrix4fv(0, 1, false, &vp[0, 0])
+        vp := cam.view_proj
+        gl.UniformMatrix4fv(0, 1, false, &vp[0, 0])
 
-    sun_orbit := renderer_sun_mat()
-    gl.UniformMatrix3fv(gl.GetUniformLocation(w.chunk_program, "u_sun_orbit"), 1, gl.FALSE, raw_data(&sun_orbit))
+        sun_orbit := renderer_sun_mat()
+        gl.UniformMatrix3fv(gl.GetUniformLocation(w.chunk_program, "u_sun_orbit"), 1, gl.FALSE, raw_data(&sun_orbit))
 
-    renderer_bind_empty_vao()
-    gl.BindTextureUnit(0, g_block_atlas.handle)
-    gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, w.vertex_pool.buffer)
-    gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 1, w.data_buffer)
-    gl.BindBuffer(gl.DRAW_INDIRECT_BUFFER, w.cmd_buffer)
-    gl.MultiDrawArraysIndirect(gl.TRIANGLES, nil, i32(w.cmd_count), 0)
+        renderer_bind_empty_vao()
+        gl.BindTextureUnit(0, g_block_atlas.handle)
+        gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, w.vertex_pool.buffer)
+        // range starts at the slot, so baseInstance stays slot-local
+        gl.BindBufferRange(gl.SHADER_STORAGE_BUFFER, 1, w.data_buffer, data_offset, data_size)
+        gl.BindBuffer(gl.DRAW_INDIRECT_BUFFER, w.cmd_buffer)
+        indirect_offset := ([^]gl.DrawArraysIndirectCommand)(rawptr(uintptr(cmd_offset)))
+        gl.MultiDrawArraysIndirect(gl.TRIANGLES, indirect_offset, i32(w.cmd_count), 0)
+    }
 
+    signal_frame_fence(w)
     return face_count
 }
 
@@ -370,24 +390,32 @@ handle_mesh_results :: proc(w : ^World) {
     }
 }
 
-/*
 @(private = "file")
-push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk) -> bool {
-    handle := chunk.handle
-    if handle.count == 0 do return false
-    if w.render_count >= w.render_cap do return false
+wait_frame_fence :: proc(w : ^World) {
+    fence := w.fences[w.frame]
+    if fence == nil do return
 
-    w.cmds[w.render_count] = gl.DrawArraysIndirectCommand {
-        count         = handle.count * 6,
-        instanceCount = 1,
-        first         = handle.offset * 6,
-        baseInstance  = w.render_count,
+    wait: for {
+        switch gl.ClientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, 1_000_000_000) {
+        case gl.ALREADY_SIGNALED, gl.CONDITION_SATISFIED:
+            break wait
+        case gl.TIMEOUT_EXPIRED:
+            fmt.eprintfln("frame fence %v: still waiting after 1s", w.frame)
+        case gl.WAIT_FAILED:
+            fmt.eprintfln("frame fence %v: ClientWaitSync failed", w.frame)
+            break wait
+        }
     }
-    w.data[w.render_count] = Per_Chunk_Data{chunk.pos.x * C_SIZE, chunk.pos.y * C_SIZE, chunk.pos.z * C_SIZE, 0}
-    w.render_count += 1
-    return true
+    gl.DeleteSync(fence)
+    w.fences[w.frame] = nil
 }
-*/
+
+@(private = "file")
+signal_frame_fence :: proc(w : ^World) {
+    assert(w.fences[w.frame] == nil)
+    w.fences[w.frame] = gl.FenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
+    w.frame = (w.frame + 1) % FRAMES_IN_FLIGHT
+}
 
 @(private = "file")
 push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (faces_pushed : u32) {
@@ -410,6 +438,8 @@ push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (face
         cam.pos.z < max_pos.z, // -Z
     }
 
+    cmd_base := w.frame * CMD_CAP
+    data_base := w.frame * w.data_stride
     data_index := w.chunk_count
     offset := handle.offset
     for face in 0 ..< 6 {
@@ -418,7 +448,7 @@ push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (face
         offset += count
         if count == 0 || !visible[face] do continue
 
-        w.cmds[w.cmd_count] = gl.DrawArraysIndirectCommand {
+        w.cmds[cmd_base + w.cmd_count] = gl.DrawArraysIndirectCommand {
             count         = count * 6,
             instanceCount = 1,
             first         = start * 6,
@@ -430,7 +460,7 @@ push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (face
 
     if faces_pushed == 0 do return 0
 
-    w.data[data_index] = Per_Chunk_Data{chunk.pos.x * C_SIZE, chunk.pos.y * C_SIZE, chunk.pos.z * C_SIZE, 0}
+    w.data[data_base + data_index] = Per_Chunk_Data{chunk.pos.x * C_SIZE, chunk.pos.y * C_SIZE, chunk.pos.z * C_SIZE, 0}
     w.chunk_count += 1
     return
 }

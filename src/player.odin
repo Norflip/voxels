@@ -13,7 +13,6 @@ WORLD_RIGHT :: vec3{1, 0, 0}
 WORLD_UP :: vec3{0, 1, 0}
 WORLD_FORWARD :: vec3{0, 0, -1}
 
-// Plain value type, no owned memory. Safe to copy freely.
 Camera :: struct {
     pos :           vec3,
     orientation :   m.quat,
@@ -161,7 +160,7 @@ player_rotate :: proc(p : ^Player, yaw_delta, pitch_delta : f32) {
 }
 
 @(private = "file")
-get_axis_input :: proc(window : glfw.WindowHandle, positive_key, negative_key : i32) -> f32 {
+get_axis_input :: #force_inline proc(window : glfw.WindowHandle, positive_key, negative_key : i32) -> f32 {
     return f32(glfw.GetKey(window, positive_key) - glfw.GetKey(window, negative_key))
 }
 

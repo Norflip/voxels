@@ -58,7 +58,7 @@ atlas_builder_add :: proc(builder : ^Atlas_Builder, path : string) -> (index : i
     idx, exists := builder.index_map[path]
     if exists do return idx, true
 
-    width, height, ok1 := read_image_dimensions(path)
+    width, height, ok1 := load_texture_info(path)
     if !ok1 do return -1, false
 
     //TODO: if we want to add more tiles per image we need to change this
@@ -94,7 +94,7 @@ atlas_builder_build :: proc(label : cstring, builder : ^Atlas_Builder) -> Atlas 
     layer_offset : i32 = 0
 
     for path, _ in builder.paths {
-        data, iw, ih, ok := load_image(path, allocator = context.temp_allocator)
+        data, iw, ih, ok := load_texture_bytes(path, allocator = context.temp_allocator)
         defer stbi.image_free(data)
         if !ok {
             gl.DeleteTextures(1, &handle)

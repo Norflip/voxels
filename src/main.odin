@@ -8,13 +8,11 @@ import "core:strings"
 import glfw "vendor:glfw"
 import gl "vendor:OpenGL"
 
-
 GL_VERSION_MAJOR :: 4
 GL_VERSION_MINOR :: 6
 
 WINDOW_ASPECT :: f32(6.0 / 5.0)
 WINDOW_MONITOR_FACTOR :: f32(0.75)
-
 
 g_player : Player
 g_is_frozen : bool
@@ -25,6 +23,7 @@ mouse_pressed : [MOUSE_BUTTON_COUNT]bool
 
 g_tracking_allocator : mem.Tracking_Allocator
 g_draw_lines : bool = true
+g_draw_text : bool = true
 
 main :: proc() {
     when ODIN_DEBUG {
@@ -143,7 +142,6 @@ main :: proc() {
         biome, bok := world_get_biome(&world, pc.x, pc.z)
         textln("biome: %v | ok: %v", biome, bok)
 
-
         textln("--------------------------------")
         textln("m total allocated: %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_allocated, g_tracking_allocator.total_memory_allocated / 1024, g_tracking_allocator.total_memory_allocated / (1024 * 1024))
         textln("m total freed:     %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_freed, g_tracking_allocator.total_memory_freed / 1024, g_tracking_allocator.total_memory_freed / (1024 * 1024))
@@ -172,8 +170,11 @@ main :: proc() {
             }
         }
 */
-        if renderer_begin_frame(g_player.camera, f32(dt)) {
-            face_count := world_render(&world, g_player.camera, g_is_frozen ? g_frozen_cam : g_player.camera, draw_lines = true)
+
+        cull_cam := g_is_frozen ? g_frozen_cam : g_player.camera
+
+        if renderer_begin_frame(g_player.camera, cull_cam, f32(dt)) {
+            face_count := world_render(&world, g_player.camera, cull_cam, draw_lines = true)
             textln("face count: %d", face_count)
             textln("chunk count: %d", world.chunk_count)
 
@@ -184,7 +185,7 @@ main :: proc() {
                 iml_clear()
             }
 
-            renderer_end_frame()
+            renderer_end_frame(g_draw_text)
         }
 
         glfw.SwapBuffers(window)
@@ -281,5 +282,9 @@ input_key_callback :: proc "c" (window : glfw.WindowHandle, key, scancode, actio
 
     if key == glfw.KEY_F2 && action == glfw.PRESS {
         g_draw_lines = !g_draw_lines
+    }
+
+    if key == glfw.KEY_F3 && action == glfw.PRESS {
+        g_draw_text = !g_draw_text
     }
 }

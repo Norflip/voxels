@@ -54,6 +54,8 @@ _ctx : struct {
     sun_local_yaw :      f32,
     sun_orbit_axis :     math.quat,
 
+
+
     // quad rendering
     program :            u32,
     quads :              u32,
@@ -66,6 +68,9 @@ _ctx : struct {
 
 @(private = "file")
 g_active_camera : Camera
+
+@(private = "file")
+g_cull_camera : Camera
 
 renderer_init :: proc(backbuffer_width, backbuffer_height : i32) -> bool {
     assert(!_ctx.initialized, "renderer_init called twice")
@@ -98,6 +103,7 @@ renderer_init :: proc(backbuffer_width, backbuffer_height : i32) -> bool {
     renderer_resize(backbuffer_width, backbuffer_height)
 
     init_text()
+    clouds_init()
     return true
 }
 
@@ -125,12 +131,13 @@ renderer_resize :: proc(backbuffer_width, backbuffer_height : i32) {
     _ctx.target = rt_create(backbuffer_width, backbuffer_height)
 }
 
-renderer_begin_frame :: proc(cam : Camera, dt : f32) -> bool {
+renderer_begin_frame :: proc(cam, cull_cam : Camera, dt : f32) -> bool {
     assert(_ctx.initialized, "renderer_begin_frame called before renderer_init")
     assert(!_ctx.in_frame, "renderer_begin_frame called twice without renderer_end_frame")
 
     if _ctx.backbuffer_width <= 0 || _ctx.backbuffer_height <= 0 do return false
     g_active_camera = cam
+    g_cull_camera = cull_cam
 
     gl.BindFramebuffer(gl.FRAMEBUFFER, _ctx.target.framebuffer)
     gl.Viewport(0, 0, _ctx.target.width, _ctx.target.height)
@@ -157,12 +164,16 @@ renderer_begin_frame :: proc(cam : Camera, dt : f32) -> bool {
     return true
 }
 
-renderer_end_frame :: proc() {
+renderer_end_frame :: proc(draw_text : bool = true) {
     renderer_assert_can_render()
     assert(_ctx.group_depth == 0, "renderer_end_frame called with unclosed render groups")
 
     renderer_bind_empty_vao()
 
+
+    orbit_axis := cast(mat3)math.mat4FromQuat(math.normalize(_ctx.sun_orbit_axis))
+    spin := math.quatAxisAngle({0, 1, 0}, _ctx.sun_local_yaw) * math.quatAxisAngle({1, 0, 1}, _ctx.sun_local_roll)
+    sun_to_local := math.transpose(orbit_axis * cast(mat3)math.mat4FromQuat(math.normalize(spin)))
     {
         renderer_group("skybox")
         gl.DepthFunc(gl.LEQUAL)
@@ -175,9 +186,6 @@ renderer_end_frame :: proc() {
         gl.UniformMatrix4fv(0, 1, gl.FALSE, raw_data(&inv_proj))
         gl.UniformMatrix4fv(1, 1, gl.FALSE, raw_data(&view))
 
-        orbit_axis := cast(mat3)math.mat4FromQuat(math.normalize(_ctx.sun_orbit_axis))
-        spin := math.quatAxisAngle({0, 1, 0}, _ctx.sun_local_yaw) * math.quatAxisAngle({1, 0, 1}, _ctx.sun_local_roll)
-        sun_to_local := math.transpose(orbit_axis * cast(mat3)math.mat4FromQuat(math.normalize(spin)))
         gl.UniformMatrix3fv(2, 1, false, raw_data(&orbit_axis))
         gl.UniformMatrix3fv(3, 1, false, raw_data(&sun_to_local))
 
@@ -186,6 +194,8 @@ renderer_end_frame :: proc() {
         gl.DepthFunc(gl.LESS)
         gl.Enable(gl.CULL_FACE)
     }
+
+    clouds_render(g_active_camera, g_cull_camera, orbit_axis, sun_to_local)
 
     {
         renderer_group("blit")
@@ -201,7 +211,11 @@ renderer_end_frame :: proc() {
         gl.DrawArrays(gl.TRIANGLES, 0, 3)
     }
 
-    render_text()
+    if draw_text {
+        render_text()
+    } else {
+        _ctx.quad_count = 0
+    }
 
     _ctx.in_frame = false
 }

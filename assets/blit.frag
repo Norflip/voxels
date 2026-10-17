@@ -24,6 +24,6 @@ void main() {
     vec3 ldr = clamp(scene, 0.0, 1.0);
 
     // we could pass the uv from the vert shader instead
-    //ldr = apply_vignette(ldr, gl_FragCoord.xy / vec2(textureSize(u_scene, 0)));
+    ldr = apply_vignette(ldr, gl_FragCoord.xy / vec2(textureSize(u_scene, 0)));
     out_color = vec4(linear_to_srgb(ldr), 1.0);
 }
