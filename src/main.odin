@@ -79,7 +79,7 @@ main :: proc() {
     defer iml_cleanup()
 
     world : World
-    world_init(&world, 0x123, {})
+    world_init(&world, 0x123, 8, {})
     // defer world_shutdown(&world)
 
     player_init(&g_player, world_get_player_spawn(&world), window)

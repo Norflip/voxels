@@ -45,11 +45,8 @@ chunk_init :: proc(c : ^Chunk, pos : [3]i32, allocator : runtime.Allocator = con
     c.blocks = nil
     c.block_allocator = allocator
     c.num_filled = 0
+    c.handle = {}
     c.dirty = true
-    c.handle = Mesh_Handle {
-        offset = 0,
-        count  = 0,
-    }
 }
 
 chunk_destroy :: proc(c : ^Chunk) {
@@ -100,7 +97,6 @@ chunk_mark_mesh_dirty :: proc "contextless" (chunk : ^Chunk) -> bool {
 
 chunk_clear_mesh_dirty :: proc "contextless" (chunk : ^Chunk) {
     intrinsics.atomic_store(&chunk.dirty, false)
-
 }
 
 chunk_generate_faces :: proc(chunk : ^Chunk, faces_out : []Chunk_Face) -> (total : u32, counts : [6]u32) {

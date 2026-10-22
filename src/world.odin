@@ -8,10 +8,7 @@ import math "core:math/linalg/glsl"
 import gl "vendor:OpenGL"
 
 //TODO:
-// implement biome specific params
 // seperate rendering
-// seperate world generation
-// implement column height tracking
 
 MAX_FACES :: C_VOLUME * 3 // * 3 for opaque, * 6 if transparent?
 RENDER_CAP :: 4096
@@ -19,6 +16,7 @@ CMD_CAP :: RENDER_CAP * 6
 FRAMES_IN_FLIGHT :: 3
 
 NEIGHBOUR_DIRS :: [4]ivec2{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
+NEIGHBOUR_DIRS_8 :: [8]ivec2{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
 
 H_SIZE :: 16
 H_SHIFT :: 4
@@ -39,6 +37,7 @@ Hunk :: struct {
     chunks :      [H_AREA][H_SIZE]^Chunk,
     cols_count :  u32,
     heightmap :   [H_WAREA]i16,
+    stamps :      [H_AREA]Column_Stamps,
 
     // readonly stuff
     cont :        Climate_Noise,
@@ -64,7 +63,9 @@ Mesh_Result :: struct {
 Column_State :: enum u8 {
     Unloaded = 0,
     Allocated,
-    Generated,
+    Generated, // terrain and stamp plan done
+    Decorating, // writing stamps, may touch all 8 neighbours
+    Decorated,
     Mesh_Queued,
 }
 
@@ -84,7 +85,7 @@ World :: struct {
     mesh_results :    queue.Queue(Mesh_Result),
     mesh_results_mu : sync.Mutex,
 
-    //
+    // world gen parameters
     load_radius :     i32,
     load_center :     [2]i32,
     seed :            i64,
@@ -106,7 +107,7 @@ World :: struct {
     vp_loc :          i32,
 }
 
-world_init :: proc(w : ^World, seed : i64, flags : World_Flags = {}) {
+world_init :: proc(w : ^World, seed : i64, load_radius : i32, flags : World_Flags = {}) {
     ok : bool
     w.chunk_program, ok = load_program("chunk", "../assets/chunk.vert", "../assets/chunk.frag")
     if !ok {
@@ -117,8 +118,8 @@ world_init :: proc(w : ^World, seed : i64, flags : World_Flags = {}) {
     w.vp_loc = gl.GetUniformLocation(w.chunk_program, "u_vp")
     w.hunks = make(map[ivec2]^Hunk, context.allocator)
     w.exiting = false
-    w.load_radius = 6
-    w.load_center = [2]i32{1, 1}
+    w.load_radius = load_radius
+    w.load_center = [2]i32{0, 0}
     w.seed = seed
     w.flags = flags
     w.biome_scale = 0.8
@@ -218,7 +219,6 @@ world_get_block :: proc(w : ^World, pos : ivec3) -> Block {
     return chunk_get_block(chunk, local_pos.x, local_pos.y, local_pos.z)
 }
 
-// Generation path: skips the heightmap, gen_thread_proc stores whole columns of heights at once.
 gen_set_block :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
     if chunk == nil do return false
     sync.rw_mutex_shared_guard(&w.hunks_mu)
@@ -361,6 +361,7 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
         renderer_bind_empty_vao()
         gl.BindTextureUnit(0, g_block_atlas.handle)
         gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, w.vertex_pool.buffer)
+
         // range starts at the slot, so baseInstance stays slot-local
         gl.BindBufferRange(gl.SHADER_STORAGE_BUFFER, 1, w.data_buffer, data_offset, data_size)
         gl.BindBuffer(gl.DRAW_INDIRECT_BUFFER, w.cmd_buffer)
@@ -588,37 +589,98 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     heights : Column_Heights
     gen_column(world, loc, &heights)
     store_column_heights(world, loc, &heights)
+    plan_column_stamps(world, loc, &heights)
 
-    ready : [5]ivec2
-    ready_count := 0
+    // only columns within 1 of loc can become decoratable now
+    decorate : [9]ivec2
+    decorate_count := 0
 
-    // readiness spans up to 4 hunks
-    // exclusive map lock instead of ordered hunk locks runs once per column
     sync.rw_mutex_lock(&world.hunks_mu)
     column_state_unsafe(world, loc)^ = .Generated
-    dirs := NEIGHBOUR_DIRS
-    candidates : [5]ivec2
-    candidates[0] = loc
-    for d, i in dirs do candidates[i + 1] = loc + d
+    for dz in i32(-1) ..= 1 {
+        for dx in i32(-1) ..= 1 {
+            c := loc + ivec2{dx, dz}
+            state := column_state_unsafe(world, c)
+            if state == nil || state^ != .Generated do continue
+            if !column_neighbours_at_least_unsafe(world, c, .Generated) do continue
+            state^ = .Decorating
+            decorate[decorate_count] = c
+            decorate_count += 1
+        }
+    }
+    sync.rw_mutex_unlock(&world.hunks_mu)
 
-    for c in candidates {
-        state := column_state_unsafe(world, c)
-        if state == nil || state^ != .Generated do continue
-        if !column_neighbours_generated_unsafe(world, c) do continue
-        state^ = .Mesh_Queued
-        ready[ready_count] = c
-        ready_count += 1
+    if decorate_count == 0 do return
+    for c in decorate[:decorate_count] do apply_column_stamps(world, c)
+
+    // only columns within 2 of loc can become mesh-ready now
+    ready : [25]ivec2
+    ready_count := 0
+
+    sync.rw_mutex_lock(&world.hunks_mu)
+    for c in decorate[:decorate_count] do column_state_unsafe(world, c)^ = .Decorated
+    for dz in i32(-2) ..= 2 {
+        for dx in i32(-2) ..= 2 {
+            c := loc + ivec2{dx, dz}
+            state := column_state_unsafe(world, c)
+            if state == nil || state^ != .Decorated do continue
+            if !column_neighbours_at_least_unsafe(world, c, .Decorated) do continue
+            state^ = .Mesh_Queued
+            ready[ready_count] = c
+            ready_count += 1
+        }
     }
     sync.rw_mutex_unlock(&world.hunks_mu)
 
     // All chunks, including empty ones, so the mesher clears their initial dirty flag.
-    // TODO: maybe not
     for c in ready[:ready_count] {
         for i in 0 ..< H_SIZE {
             pos := ivec3{c.x, i32(i), c.y}
             if get_chunk(world, pos) != nil do worker_push(&world.mesh_thread, pos)
         }
     }
+}
+
+gen_stamp_block :: proc(w : ^World, wpos : ivec3, block : Block) -> bool {
+    sync.rw_mutex_shared_guard(&w.hunks_mu)
+    chunk_pos, local := modiv_world_chunk_local(wpos)
+    chunk := get_chunk_unsafe(w, chunk_pos)
+    if chunk == nil do return false
+    if chunk_get_block(chunk, local.x, local.y, local.z) != .Air do return false
+    if !set_block_internal(w, chunk, local.x, local.y, local.z, block) do return false
+    if block_is_solid(block) do raise_height_unsafe(w, wpos)
+    return true
+}
+
+@(private = "file")
+raise_height_unsafe :: proc(w : ^World, wpos : ivec3) {
+    key, local := modiv_world_hunk_local(wpos)
+    hunk := w.hunks[key]
+    if hunk == nil do return
+    h := &hunk.heightmap[local.z * H_WSIZE + local.x]
+    new_top := i16(wpos.y)
+    cur := intrinsics.atomic_load_explicit(h, .Relaxed)
+    for cur < new_top {
+        prev, ok := intrinsics.atomic_compare_exchange_weak_explicit(h, cur, new_top, .Relaxed, .Relaxed)
+        if ok do break
+        cur = prev
+    }
+}
+
+@(private = "file")
+column_at_least_unsafe :: proc(w : ^World, col : ivec2, min_state : Column_State) -> bool {
+    state := column_state_unsafe(w, col)
+    if state == nil || state^ == .Unloaded do return .No_Ring in w.flags
+    return state^ >= min_state
+}
+
+@(private = "file")
+column_neighbours_at_least_unsafe :: proc(w : ^World, col : ivec2, min_state : Column_State) -> bool {
+    dirs := NEIGHBOUR_DIRS_8
+    for d in dirs {
+        if !column_at_least_unsafe(w, col + d, min_state) do return false
+    }
+    return true
 }
 
 @(private = "file")
