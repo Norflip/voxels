@@ -7,9 +7,6 @@ import "base:intrinsics"
 import math "core:math/linalg/glsl"
 import gl "vendor:OpenGL"
 
-//TODO:
-// seperate rendering
-
 MAX_FACES :: C_VOLUME * 3 // * 3 for opaque, * 6 if transparent?
 RENDER_CAP :: 4096
 CMD_CAP :: RENDER_CAP * 6
@@ -29,6 +26,20 @@ H_WAREA :: H_WSIZE * H_WSIZE
 CLIMATE_JUMP :: 16
 CLIMATE_STEPS :: H_WSIZE / CLIMATE_JUMP + 1
 Climate_Noise :: Noise_Area(H_WSIZE, CLIMATE_JUMP)
+
+MAX_STAMPS_PER_COLUMN :: (C_SIZE / TREE_CELL) * (C_SIZE / TREE_CELL)
+
+Stamp_Placement :: struct {
+    //pos :  ivec3,
+    x, z : u8,
+    y :    u16,
+    kind : Stamp_Kind,
+}
+
+Column_Stamps :: struct {
+    count : u8,
+    items : [MAX_STAMPS_PER_COLUMN]Stamp_Placement,
+}
 
 Hunk :: struct {
     pos :         ivec2,
@@ -140,6 +151,7 @@ world_init :: proc(w : ^World, seed : i64, load_radius : i32, flags : World_Flag
     worker_init(&w.gen_thread, gen_thread_proc, w, 0, "gen_thread")
     worker_init(&w.mesh_thread, mesh_thread_proc, w, MESH_SCRATCH_SIZE, "mesh_thread")
 
+    stamps_init()
     load_init_chunks(w)
     fmt.printf("world initialized\n")
 }
@@ -219,11 +231,6 @@ world_get_block :: proc(w : ^World, pos : ivec3) -> Block {
     return chunk_get_block(chunk, local_pos.x, local_pos.y, local_pos.z)
 }
 
-gen_set_block :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
-    if chunk == nil do return false
-    sync.rw_mutex_shared_guard(&w.hunks_mu)
-    return set_block_internal(w, chunk, x, y, z, block)
-}
 
 world_set_block :: proc(w : ^World, pos : ivec3, block : Block) -> bool {
     sync.rw_mutex_shared_guard(&w.hunks_mu)
@@ -587,9 +594,10 @@ gen_thread_proc :: proc(loc : ivec2, _ : mem.Allocator, user_data : rawptr) {
     world := cast(^World)user_data
 
     heights : Column_Heights
-    gen_column(world, loc, &heights)
+    shape : Column_Shape
+    gen_column(world, loc, &heights, &shape)
     store_column_heights(world, loc, &heights)
-    plan_column_stamps(world, loc, &heights)
+    plan_column_stamps(world, loc, &heights, &shape)
 
     // only columns within 1 of loc can become decoratable now
     decorate : [9]ivec2
@@ -652,6 +660,16 @@ gen_stamp_block :: proc(w : ^World, wpos : ivec3, block : Block) -> bool {
     return true
 }
 
+gen_set_block :: proc(w : ^World, chunk : ^Chunk, x, y, z : i32, block : Block) -> bool {
+    if chunk == nil do return false
+    sync.rw_mutex_shared_guard(&w.hunks_mu)
+    return set_block_internal(w, chunk, x, y, z, block)
+}
+
+world_column_seed :: #force_inline proc(seed : i64, col : ivec2, salt : u64 = 0x5747_4D50) -> u64 {
+    return u64(seed) ~ salt ~ (u64(u32(col.x)) << 32 | u64(u32(col.y)))
+}
+
 @(private = "file")
 raise_height_unsafe :: proc(w : ^World, wpos : ivec3) {
     key, local := modiv_world_hunk_local(wpos)
@@ -689,17 +707,6 @@ column_state_unsafe :: proc(w : ^World, col : ivec2) -> ^Column_State {
     hunk := w.hunks[key]
     if hunk == nil do return nil
     return &hunk.columns[idx]
-}
-
-@(private = "file")
-column_neighbours_generated_unsafe :: proc(w : ^World, loc : ivec2) -> bool {
-    dirs := NEIGHBOUR_DIRS
-    for d in dirs {
-        state := column_state_unsafe(w, loc + d)
-        // unloaded column is treated as world edge, must become "not ready" once columns stream or something
-        if state != nil && state^ == .Allocated do return false
-    }
-    return true
 }
 
 @(private = "file")

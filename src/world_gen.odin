@@ -1,6 +1,7 @@
 package main
 import "core:math"
 import "core:sync"
+import "core:math/rand"
 
 Column_Heights :: [C_SIZE][C_SIZE]i32
 Chunk_Noise :: Noise_Volume(C_SIZE, C_SIZE, 4, 8)
@@ -11,6 +12,9 @@ FLATGRASS_HEIGHT :: 20
 
 MOUNTAIN_BLEND :: 0.15
 BIOME_BLEND :: 0.05
+
+// much sharper than terrain, tree density only fades near biome borders
+TREE_BLEND :: 0.01 
 
 // continental
 CONT_OCTAVE :: 4
@@ -30,6 +34,34 @@ RAIN_FREQ :: 1.0 / 1100.0
 SELECT_OCTAVE :: 4
 SELECT_FREQ :: 1.0 / 60.0
 SELECT_SHARPNESS :: 6.0
+
+CARVE_BOUND :: 1.0 // must be >= max |carve_at|, i.e. the bound of noise_fbm
+
+COLUMN_SHAPE_SIZE :: C_SIZE + 1
+COLUMN_SHAPE_AREA :: COLUMN_SHAPE_SIZE * COLUMN_SHAPE_SIZE
+
+SLOPE_RADIUS :: 1
+
+// tree placement chance per candidate, blended across biome borders
+// TODO: register per biome
+@(private = "file", rodata)
+BIOME_TREES := [Biome]f64 {
+    .Plains    = 0.04,
+    .Forest    = 0.4,
+    .Desert    = 0.0,
+    .Mountains = 0.0,
+    .Flat      = 0.0,
+}
+
+Column_Shape :: struct {
+    surface :     [COLUMN_SHAPE_AREA]f64,
+    carve_amp :   [COLUMN_SHAPE_AREA]f64,
+    squash :      [COLUMN_SHAPE_AREA]f64,
+    trees :       [COLUMN_SHAPE_AREA]f32,
+    origin :      ivec2, 
+    air_above :   i32,   
+    solid_below : i32,   
+}
 
 Biome :: enum u8 {
     Plains,
@@ -77,8 +109,8 @@ BIOME_SURFACE := [Biome]Biome_Surface {
     .Flat      = {top = .Grass, sub = .Dirt, depth = 3},
 }
 
-gen_column :: proc(w : ^World, loc : ivec2, heights : ^Column_Heights) {
-    column : [H_SIZE]^Chunk
+gen_column :: proc(w : ^World, loc : ivec2, heights : ^Column_Heights, shape : ^Column_Shape) {
+     column : [H_SIZE]^Chunk
 
     key, _ := hunk_column_index(loc)
     hunk : ^Hunk
@@ -87,21 +119,58 @@ gen_column :: proc(w : ^World, loc : ivec2, heights : ^Column_Heights) {
         hunk = w.hunks[key]
     }
 
+    for i in 0 ..< H_SIZE do column[i] = get_chunk(w, ivec3{loc.x, i32(i), loc.y})
+
     if .Gen_Flat in w.flags {
+        shape^ = {}
         max_col_y := (FLATGRASS_HEIGHT / C_SIZE) + 1
-        for i in 0 ..< max_col_y {
-            column[i] = get_chunk(w, ivec3{loc.x, i32(i), loc.y})
-            gen_flat_shape(w, column[i], heights)
-        }
+        for i in 0 ..< max_col_y do gen_flat_shape(w, column[i], heights)
     } else {
-        for i in 0 ..< H_SIZE {
-            column[i] = get_chunk(w, ivec3{loc.x, i32(i), loc.y})
-            gen_shape(w, hunk, column[i], heights)
-        }
+        column_shape_fill(hunk, loc, shape)
+        for i in 0 ..< H_SIZE do gen_shape(w, shape, column[i], heights)
     }
 
     gen_surface(w, hunk, &column, heights)
     if column[0] != nil do gen_mantle(w, column[0])
+}
+
+
+@(private = "file")
+column_shape_fill :: proc(hunk : ^Hunk, col : ivec2, s : ^Column_Shape) {
+    s.origin = col * C_SIZE
+    hunk_origin := hunk.pos * H_WSIZE
+    lx0 := s.origin.x - hunk_origin.x
+    lz0 := s.origin.y - hunk_origin.y
+
+    air_hi := min(f64)
+    solid_lo := max(f64)
+    for z in 0 ..< i32(COLUMN_SHAPE_SIZE) {
+        for x in 0 ..< i32(COLUMN_SHAPE_SIZE) {
+            cont := f64(noise_area_sample(&hunk.cont, lx0 + x, lz0 + z))
+            temp := f64(noise_area_sample(&hunk.temperature, lx0 + x, lz0 + z))
+            rain := f64(noise_area_sample(&hunk.rain, lx0 + x, lz0 + z))
+            climate := Climate{temp, rain, cont}
+            weights := biome_weights(climate, BIOME_BLEND)
+            surface, carve_amp, squash := shape_from_weights(weights, cont)
+
+            tree_weights := biome_weights(climate, TREE_BLEND)
+            trees := 0.0
+            for b in Biome do trees += tree_weights[b] * BIOME_TREES[b]
+
+            i := z * COLUMN_SHAPE_SIZE + x
+            s.surface[i] = surface
+            s.carve_amp[i] = carve_amp
+            s.squash[i] = squash
+            s.trees[i] = f32(trees)
+
+            band := squash > 0 ? carve_amp * CARVE_BOUND / squash : f64(H_SIZE * C_SIZE)
+            air_hi = max(air_hi, surface + band)
+            solid_lo = min(solid_lo, surface - band)
+        }
+    }
+    // 1 block margin on each side for rounding
+    s.air_above = i32(math.ceil(air_hi)) + 1
+    s.solid_below = i32(math.floor(solid_lo)) - 1
 }
 
 hunk_gen_climate :: proc(w : ^World, hunk : ^Hunk) {
@@ -130,24 +199,30 @@ hunk_gen_climate :: proc(w : ^World, hunk : ^Hunk) {
 }
 
 @(private = "file")
-gen_shape :: proc(w : ^World, hunk : ^Hunk, chunk : ^Chunk, heights : ^Column_Heights) {
+gen_shape :: proc(w : ^World, shape : ^Column_Shape, chunk : ^Chunk, heights : ^Column_Heights) {
+    base_y := chunk.pos.y * C_SIZE
+    if base_y >= shape.air_above do return
+
+    // top noise sample sits at base_y + C_SIZE, so the whole chunk is solid
+    if base_y + C_SIZE < shape.solid_below {
+        for x in 0 ..< i32(C_SIZE) {
+            for z in 0 ..< i32(C_SIZE) {
+                for y in 0 ..< i32(C_SIZE) do gen_set_block(w, chunk, x, y, z, .Stone)
+                heights[x][z] = max(heights[x][z], base_y + C_SIZE - 1)
+            }
+        }
+        return
+    }
+
     vol : Chunk_Noise
     noise_vol_fill(&vol, w.seed, chunk.pos * C_SIZE, proc(seed : i64, wx, wy, wz : f64, ctx : rawptr) -> f64 {
-            h := (^Hunk)(ctx)
-            origin := h.pos * H_WSIZE
-            lx := i32(wx) - origin.x
-            lz := i32(wz) - origin.y
+            s := (^Column_Shape)(ctx)
+            i := (i32(wz) - s.origin.y) * COLUMN_SHAPE_SIZE + (i32(wx) - s.origin.x)
+            carve := carve_at(seed, wx, wy, wz)
+            when ODIN_DEBUG do assert(abs(carve) <= CARVE_BOUND, "CARVE_BOUND too small for noise_fbm")
+            return carve * s.carve_amp[i] + (s.surface[i] - wy) * s.squash[i]
+        }, shape)
 
-            cont := f64(noise_area_sample(&h.cont, lx, lz))
-            temp := f64(noise_area_sample(&h.temperature, lx, lz))
-            rain := f64(noise_area_sample(&h.rain, lx, lz))
-
-            surface, carve_amp, squash := shape_at(cont, temp, rain)
-            carve := carve_at(seed, wx, wy, wz) * carve_amp
-            return carve + (surface - wy) * squash
-        }, hunk)
-
-    base_y := chunk.pos.y * C_SIZE
     for x in 0 ..< i32(C_SIZE) {
         for z in 0 ..< i32(C_SIZE) {
             for y : i32 = C_SIZE - 1; y >= 0; y -= 1 {
@@ -160,6 +235,7 @@ gen_shape :: proc(w : ^World, hunk : ^Hunk, chunk : ^Chunk, heights : ^Column_He
         }
     }
 }
+
 
 @(private = "file")
 gen_flat_shape :: proc(w : ^World, chunk : ^Chunk, heights : ^Column_Heights) {
@@ -254,7 +330,7 @@ classify_biome :: proc(temp, rain, cont : f32) -> Biome {
 }
 
 @(private = "file")
-biome_weights :: #force_inline proc(c : Climate) -> (w : [Biome]f64) {
+biome_weights :: #force_inline proc(c : Climate, blend : f64) -> (w : [Biome]f64) {
     d := biome_dist_sq(c)
     d_min := max(f64)
     for b in Biome {
@@ -265,7 +341,7 @@ biome_weights :: #force_inline proc(c : Climate) -> (w : [Biome]f64) {
     total := 0.0
     for b in Biome {
         if b == .Flat do continue
-        w[b] = math.exp((d_min - d[b]) / BIOME_BLEND)
+        w[b] = math.exp((d_min - d[b]) / blend)
         total += w[b]
     }
     for b in Biome do w[b] /= total
@@ -282,6 +358,135 @@ carve_at :: #force_inline proc(seed : i64, x, y, z : f64) -> f64 {
     return lo + (hi - lo) * sel
 }
 
+
+// replaces shape_at
+@(private = "file")
+shape_from_weights :: #force_inline proc(weights : [Biome]f64, cont : f64) -> (surface, carve_amp, squash : f64) {
+    surface = f64(SEA_HEIGHT) + SURFACE_HEIGHT
+    for b in Biome {
+        s := BIOME_SHAPE[b]
+        surface += weights[b] * (s.lift + cont * s.cont_amp)
+        carve_amp += weights[b] * s.carve_amp
+        squash += weights[b] * s.squash
+    }
+    return
+}
+
+@(private = "file")
+height_gradient :: proc(h : ^Column_Heights, x, z : i32) -> (gx, gz : f32) {
+    at :: proc(h : ^Column_Heights, x, z : i32) -> f32 {
+        if x < 0 || x >= C_SIZE || z < 0 || z >= C_SIZE do return 0
+        return f32(h[x][z])
+    }
+    gx = ((at(h, x + 1, z - 1) + 2 * at(h, x + 1, z) + at(h, x + 1, z + 1)) - (at(h, x - 1, z - 1) + 2 * at(h, x - 1, z) + at(h, x - 1, z + 1))) / 8
+    gz = ((at(h, x - 1, z + 1) + 2 * at(h, x, z + 1) + at(h, x + 1, z + 1)) - (at(h, x - 1, z - 1) + 2 * at(h, x, z - 1) + at(h, x + 1, z - 1))) / 8
+    return
+}
+
+// every non-air bottom cell must rest on terrain at exactly ground_y
+// TODO: make this optional per stamp type
+@(private = "file")
+footprint_is_flat :: proc(s : Stamp, heights : ^Column_Heights, x, z, ground_y : i32) -> bool {
+    for sz in 0 ..< s.size.z {
+        for sx in 0 ..< s.size.x {
+            if s.blocks[sz * s.size.x + sx] == .Air do continue
+            gx := x + sx - s.anchor.x
+            gz := z + sz - s.anchor.z
+            if heights[gx][gz] != ground_y do return false
+        }
+    }
+    return true
+}
+
+// dot(normalize(-gx, 1, -gz), up) >= min_up
+@(private = "file")
+slope_ok :: #force_inline proc(gx, gz, min_up : f32) -> bool {
+    if min_up <= 0 do return true
+    return gx * gx + gz * gz <= 1 / (min_up * min_up) - 1
+}
+
+plan_column_stamps :: proc(w : ^World, col : ivec2, heights : ^Column_Heights, shape : ^Column_Shape) {
+    key, idx := hunk_column_index(col)
+    hunk : ^Hunk
+    {
+        sync.rw_mutex_shared_guard(&w.hunks_mu)
+        hunk = w.hunks[key]
+    }
+    if hunk == nil do return
+
+    plan := &hunk.stamps[idx]
+    plan^ = {}
+
+    stamp := stamp_get(.Tree)
+    lo, hi := stamp.foot_lo, stamp.foot_hi
+    span := [2]i32{min(TREE_JITTER, TREE_CELL - (hi.x - lo.x)), min(TREE_JITTER, TREE_CELL - (hi.y - lo.y))}
+    assert(span.x > 0 && span.y > 0, "stamp footprint wider than TREE_CELL")
+
+    state : rand.Xoshiro256_Random_State
+    gen := rand.xoshiro256_random_generator(&state)
+    rand.reset(world_column_seed(w.seed, col), gen) 
+
+    for cz in 0 ..< i32(C_SIZE / TREE_CELL) {
+        for cx in 0 ..< i32(C_SIZE / TREE_CELL) {
+            jx := rand.int31_max(span.x, gen)
+            jz := rand.int31_max(span.y, gen)
+            roll := rand.float32(gen)
+
+            x := cx * TREE_CELL - lo.x + jx
+            z := cz * TREE_CELL - lo.y + jz
+
+            //if roll >= column_shape_trees(shape, x, z) do continue
+            if roll >= shape.trees[z * COLUMN_SHAPE_SIZE + x] do continue
+
+            top := heights[x][z]
+            if top < 0 || top + 1 >= H_SIZE * C_SIZE do continue
+
+            gx, gz := height_gradient(heights, x, z)
+            if !slope_ok(gx, gz, stamp.min_up) do continue
+            if !footprint_is_flat(stamp, heights, x, z, top) do continue
+
+            ground := world_get_block(w, {col.x * C_SIZE + x, top, col.y * C_SIZE + z})
+            if !stamp.ground(ground) do continue
+
+            plan.items[plan.count] = {x = u8(x), z = u8(z), y = u16(top + 1), kind = .Tree}
+            plan.count += 1
+        }
+    }
+}
+
+// caller guarantees col is .Decorating, so all 8 neighbours have terrain?
+apply_column_stamps :: proc(w : ^World, col : ivec2) {
+    key, idx := hunk_column_index(col)
+    hunk : ^Hunk
+    {
+        sync.rw_mutex_shared_guard(&w.hunks_mu)
+        hunk = w.hunks[key]
+    }
+    if hunk == nil do return
+
+    plan := hunk.stamps[idx]
+    for p in plan.items[:plan.count] {
+        stamp := stamp_get(p.kind)
+        pos := ivec3{col.x * C_SIZE + i32(p.x), i32(p.y), col.y * C_SIZE + i32(p.z)}
+        origin := pos - stamp.anchor
+        i := 0
+        for y in 0 ..< stamp.size.y {
+            for z in 0 ..< stamp.size.z {
+                for x in 0 ..< stamp.size.x {
+                    block := stamp.blocks[i]
+                    i += 1
+                    if block == .Air do continue
+
+                    cell := origin + ivec3{x, y, z}
+                    assert(abs((cell.x >> C_SHIFT) - col.x) <= 1 && abs((cell.z >> C_SHIFT) - col.y) <= 1, "stamp reaches past the 8-neighbour ring")
+                    gen_stamp_block(w, cell, block)
+                }
+            }
+        }
+    }
+}
+
+/*
 @(private = "file")
 shape_at :: #force_inline proc(cont, temp, rain : f64) -> (surface, carve_amp, squash : f64) {
     weights := biome_weights({temp, rain, cont})
@@ -294,3 +499,4 @@ shape_at :: #force_inline proc(cont, temp, rain : f64) -> (surface, carve_amp, s
     }
     return
 }
+*/

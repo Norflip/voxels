@@ -7,6 +7,8 @@ Block :: enum u8 {
     Dirt,
     Grass,
     Sand,
+    Log,
+    Leaves,
 }
 
 BLOCK_COUNT :: len(Block)
@@ -18,12 +20,17 @@ block_init :: proc() {
     atlas_builder_init(&atlas_builder, 8, 8, context.temp_allocator)
     defer atlas_builder_destroy(&atlas_builder)
 
-    atlas_builder_add(&atlas_builder, "../assets/blocks/stone.png")
-    atlas_builder_add(&atlas_builder, "../assets/blocks/mantle.png")
-    atlas_builder_add(&atlas_builder, "../assets/blocks/dirt.png")
-    atlas_builder_add(&atlas_builder, "../assets/blocks/grass_top.png")
-    atlas_builder_add(&atlas_builder, "../assets/blocks/grass_side.png")
-    atlas_builder_add(&atlas_builder, "../assets/blocks/sand.png")
+    atlas_builder_add(&atlas_builder, "../assets/blocks/stone.png") // 0
+    atlas_builder_add(&atlas_builder, "../assets/blocks/mantle.png") // 1
+    atlas_builder_add(&atlas_builder, "../assets/blocks/dirt.png") // 2
+    atlas_builder_add(&atlas_builder, "../assets/blocks/grass_top.png") // 3
+    atlas_builder_add(&atlas_builder, "../assets/blocks/grass_side.png") // 4
+    atlas_builder_add(&atlas_builder, "../assets/blocks/sand.png") // 5
+    atlas_builder_add(&atlas_builder, "../assets/blocks/log_side.png") // 6
+    atlas_builder_add(&atlas_builder, "../assets/blocks/log_top.png") // 7
+    atlas_builder_add(&atlas_builder, "../assets/blocks/leaves.png") // 8
+
+
 
     g_block_atlas = atlas_builder_build("block_atlas", &atlas_builder)
 }
@@ -54,6 +61,11 @@ block_get_atlas_index :: proc(b : Block, face : int) -> (index : u32, ok : bool)
         return 4, true
     case Block.Sand:
         return 5, true
+    case Block.Log:
+        if face == 2 || face == 3 do return 7, true
+        return 6, true
+    case Block.Leaves:
+        return 8, true
     case Block.Air:
         return 0, false
     }

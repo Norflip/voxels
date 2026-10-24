@@ -1,126 +1,124 @@
 package main
 
-import "core:sync"
-
-MAX_STAMPS_PER_COLUMN :: 8
-BOULDER_ATTEMPTS :: 4
-BOULDER_CHANCE_PERCENT :: 80
+TREE_CELL :: 4
+TREE_JITTER :: 2 // min spacing between anchors is TREE_CELL - TREE_JITTER + 1
+#assert(C_SIZE % TREE_CELL == 0)
+#assert(TREE_JITTER <= TREE_CELL)
 
 Stamp_Kind :: enum u8 {
-    Boulder,
+    Tree,
 }
 
 Stamp :: struct {
-    size :   ivec3,
-    anchor : ivec3,
-    blocks : []Block,
+    size :    ivec3,
+    anchor :  ivec3,
+    blocks :  []Block,
+    min_up :  f32, // min dot(terrain normal, up) at the anchor
+    ground :  proc(b : Block) -> bool,
+    foot_lo : [2]i32,
+    foot_hi : [2]i32,
 }
 
-Stamp_Placement :: struct {
-    pos :  ivec3,
-    kind : Stamp_Kind,
-}
+@(private = "file")
+A :: Block.Air
+@(private = "file")
+S :: Block.Log
+@(private = "file")
+L :: Block.Leaves
 
-Column_Stamps :: struct {
-    count : u8,
-    items : [MAX_STAMPS_PER_COLUMN]Stamp_Placement,
-}
-
+//odinfmt: disable
 @(private = "file", rodata)
-BOULDER_BLOCKS := [3 * 2 * 3]Block {
-    .Stone, .Stone, .Stone,
-    .Stone, .Stone, .Stone,
-    .Stone, .Stone, .Stone,
-
-    .Air,   .Stone, .Air,
-    .Stone, .Stone, .Stone,
-    .Air,   .Stone, .Air,
+TREE_BLOCKS := [5 * 7 * 5]Block {
+    // y = 0
+    A, A, A, A, A,
+    A, A, A, A, A,
+    A, A, S, A, A,
+    A, A, A, A, A,
+    A, A, A, A, A,
+    // y = 1
+    A, A, A, A, A,
+    A, A, A, A, A,
+    A, A, S, A, A,
+    A, A, A, A, A,
+    A, A, A, A, A,
+    // y = 2
+    A, A, A, A, A,
+    A, A, A, A, A,
+    A, A, S, A, A,
+    A, A, A, A, A,
+    A, A, A, A, A,
+    // y = 3
+    A, L, L, L, A,
+    L, L, L, L, L,
+    L, L, S, L, L,
+    L, L, L, L, L,
+    A, L, L, L, A,
+    // y = 4
+    A, L, L, L, A,
+    L, L, L, L, L,
+    L, L, S, L, L,
+    L, L, L, L, L,
+    A, L, L, L, A,
+    // y = 5
+    A, A, A, A, A,
+    A, L, L, L, A,
+    A, L, S, L, A,
+    A, L, L, L, A,
+    A, A, A, A, A,
+    // y = 6
+    A, A, A, A, A,
+    A, A, L, A, A,
+    A, L, L, L, A,
+    A, A, L, A, A,
+    A, A, A, A, A,
 }
-
-stamp_get :: proc(kind : Stamp_Kind) -> Stamp {
-    switch kind {
-    case .Boulder:
-        return {size = {3, 2, 3}, anchor = {1, 0, 1}, blocks = BOULDER_BLOCKS[:]}
-    }
-    panic("stamp_get: unknown stamp kind")
-}
+//odinfmt: enable
 
 @(private = "file")
-splitmix64 :: #force_inline proc(state : ^u64) -> u64 {
-    state^ += 0x9E3779B97F4A7C15
-    z := state^
-    z = (z ~ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ~ (z >> 27)) * 0x94D049BB133111EB
-    return z ~ (z >> 31)
+g_stamps : [Stamp_Kind]Stamp
+
+stamps_init :: proc() {
+    g_stamps[.Tree] = {
+        size = {5, 7, 5},
+        anchor = {2, 0, 2},
+        blocks = TREE_BLOCKS[:],
+        min_up = 0.7,
+        ground = proc(b : Block) -> bool {
+            return b == .Grass || b == .Dirt
+        },
+    }
+
+    for &s, kind in g_stamps {
+        assert(s.blocks != nil, "stamp kind missing from stamps_init")
+        s.foot_lo, s.foot_hi = stamp_footprint(s)
+    }
 }
 
-// replace with an odinlang builtin proc
+stamp_get :: #force_inline proc(kind : Stamp_Kind) -> Stamp {
+    return g_stamps[kind]
+}
+
+stamp_index :: #force_inline proc(s : Stamp, x, y, z : i32) -> i32 {
+    return (y * s.size.z + z) * s.size.x + x
+}
+
+// bounds of the bottom layer's non-air cells relative to the anchor
+// planted stamps are anchored on a solid bottom cell
 @(private = "file")
-column_rng :: proc(seed : i64, col : ivec2) -> u64 {
-    state := u64(seed) ~ 0x5747_4D50 ~ (u64(u32(col.x)) << 32 | u64(u32(col.y)))
-    splitmix64(&state)
-    return state
-}
+stamp_footprint :: proc(s : Stamp) -> (lo, hi : [2]i32) {
+    assert(len(s.blocks) == int(s.size.x * s.size.y * s.size.z), "stamp blocks length does not match size")
+    assert(s.anchor.y == 0, "planted stamp must be anchored on its bottom layer")
+    assert(s.blocks[stamp_index(s, s.anchor.x, 0, s.anchor.z)] != .Air, "planted stamp anchor must be a solid bottom cell")
 
-plan_column_stamps :: proc(w : ^World, col : ivec2, heights : ^Column_Heights) {
-    key, idx := hunk_column_index(col)
-    hunk : ^Hunk
-    {
-        sync.rw_mutex_shared_guard(&w.hunks_mu)
-        hunk = w.hunks[key]
-    }
-    if hunk == nil do return
-
-    plan := &hunk.stamps[idx]
-    plan^ = {}
-
-    rng := column_rng(w.seed, col)
-    for _ in 0 ..< BOULDER_ATTEMPTS {
-        r := splitmix64(&rng)
-        if r % 100 >= BOULDER_CHANCE_PERCENT do continue
-        if plan.count == MAX_STAMPS_PER_COLUMN do break
-
-        x := i32((r >> 8) & (C_SIZE - 1))
-        z := i32((r >> 16) & (C_SIZE - 1))
-        top := heights[x][z]
-        if top < 0 || top + 1 >= H_SIZE * C_SIZE do continue
-
-        plan.items[plan.count] = {
-            pos  = {col.x * C_SIZE + x, top + 1, col.y * C_SIZE + z},
-            kind = .Boulder,
-        }
-        plan.count += 1
-    }
-}
-
-// caller guarantees col is .Decorating, so all 8 neighbours have terrain?
-apply_column_stamps :: proc(w : ^World, col : ivec2) {
-    key, idx := hunk_column_index(col)
-    hunk : ^Hunk
-    {
-        sync.rw_mutex_shared_guard(&w.hunks_mu)
-        hunk = w.hunks[key]
-    }
-    if hunk == nil do return
-
-    plan := hunk.stamps[idx]
-    for p in plan.items[:plan.count] {
-        stamp := stamp_get(p.kind)
-        origin := p.pos - stamp.anchor
-        i := 0
-        for y in 0 ..< stamp.size.y {
-            for z in 0 ..< stamp.size.z {
-                for x in 0 ..< stamp.size.x {
-                    block := stamp.blocks[i]
-                    i += 1
-                    if block == .Air do continue
-
-                    cell := origin + ivec3{x, y, z}
-                    assert(abs((cell.x >> C_SHIFT) - col.x) <= 1 && abs((cell.z >> C_SHIFT) - col.y) <= 1,
-                        "stamp reaches past the 8-neighbour ring")
-                    gen_stamp_block(w, cell, block)
-                }
-            }
+    lo = {max(i32), max(i32)}
+    hi = {min(i32), min(i32)}
+    for z in 0 ..< s.size.z {
+        for x in 0 ..< s.size.x {
+            if s.blocks[stamp_index(s, x, 0, z)] == .Air do continue
+            d := [2]i32{x, z} - s.anchor.xz
+            lo = {min(lo.x, d.x), min(lo.y, d.y)}
+            hi = {max(hi.x, d.x), max(hi.y, d.y)}
         }
     }
+    return
 }
