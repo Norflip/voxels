@@ -88,34 +88,34 @@ World_Flag :: enum u8 {
 World_Flags :: bit_set[World_Flag;u8]
 
 World :: struct {
-    hunks :           map[ivec2]^Hunk,
-    hunks_mu :        sync.RW_Mutex,
-    gen_thread :      Worker(ivec2),
-    mesh_thread :     Worker(ivec3),
-    exiting :         b32,
-    mesh_results :    queue.Queue(Mesh_Result),
-    mesh_results_mu : sync.Mutex,
+    hunks :               map[ivec2]^Hunk,
+    hunks_mu :            sync.RW_Mutex,
+    gen_thread :          Worker(ivec2),
+    mesh_thread :         Worker(ivec3),
+    exiting :             b32,
+    mesh_results :        queue.Queue(Mesh_Result),
+    mesh_results_mu :     sync.Mutex,
 
     // world gen parameters
-    load_radius :     i32,
-    load_center :     [2]i32,
-    seed :            i64,
-    flags :           World_Flags,
-    biome_scale :     f64,
+    load_radius :         i32,
+    load_center :         [2]i32,
+    seed :                i64,
+    flags :               World_Flags,
+    biome_scale :         f64,
 
     // rendering
-    chunk_count :     u32,
-    cmd_count :       u32,
-    cmds :            [^]gl.DrawArraysIndirectCommand, // FRAMES_IN_FLIGHT slots of CMD_CAP
-    data :            [^]Per_Chunk_Data, // FRAMES_IN_FLIGHT slots of data_stride
-    cmd_buffer :      u32,
-    data_buffer :     u32,
-    data_stride :     u32, // elements per data slot, SSBO offset aligned
-    frame :           u32, // slot being written this frame
-    fences :          [FRAMES_IN_FLIGHT]gl.sync_t,
-    vertex_pool :     Vertex_Pool(Chunk_Face),
-    chunk_program :   u32,
-    vp_loc :          i32,
+    visible_chunk_count : u32,
+    cmd_count :           u32,
+    cmds :                [^]gl.DrawArraysIndirectCommand, // FRAMES_IN_FLIGHT slots of CMD_CAP
+    data :                [^]Per_Chunk_Data, // FRAMES_IN_FLIGHT slots of data_stride
+    cmd_buffer :          u32,
+    data_buffer :         u32,
+    data_stride :         u32, // elements per data slot, SSBO offset aligned
+    frame :               u32, // slot being written this frame
+    fences :              [FRAMES_IN_FLIGHT]gl.sync_t,
+    vertex_pool :         Vertex_Pool(Chunk_Face),
+    chunk_program :       u32,
+    vp_loc :              i32,
 }
 
 world_init :: proc(w : ^World, seed : i64, load_radius : i32, flags : World_Flags = {}) {
@@ -318,7 +318,7 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
     wait_frame_fence(w)
 
     w.cmd_count = 0
-    w.chunk_count = 0
+    w.visible_chunk_count = 0
     face_count : u32 = 0
 
     sync.rw_mutex_shared_lock(&w.hunks_mu)
@@ -349,7 +349,7 @@ world_render :: proc(w : ^World, cam : Camera, cull_cam : Camera, draw_lines : b
     if w.cmd_count > 0 {
         cmd_offset := int(w.frame * CMD_CAP) * size_of(gl.DrawArraysIndirectCommand)
         data_offset := int(w.frame * w.data_stride) * size_of(Per_Chunk_Data)
-        data_size := int(w.chunk_count) * size_of(Per_Chunk_Data)
+        data_size := int(w.visible_chunk_count) * size_of(Per_Chunk_Data)
 
         gl.FlushMappedNamedBufferRange(w.cmd_buffer, cmd_offset, int(w.cmd_count) * size_of(gl.DrawArraysIndirectCommand))
         gl.FlushMappedNamedBufferRange(w.data_buffer, data_offset, data_size)
@@ -429,7 +429,7 @@ signal_frame_fence :: proc(w : ^World) {
 push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (faces_pushed : u32) {
     handle := chunk.handle
     if handle.count == 0 do return 0
-    if w.chunk_count >= RENDER_CAP || w.cmd_count + 6 > CMD_CAP do return 0
+    if w.visible_chunk_count >= RENDER_CAP || w.cmd_count + 6 > CMD_CAP do return 0
 
     min_pos := vec3(chunk.pos * C_SIZE)
     max_pos := min_pos + C_SIZE
@@ -448,7 +448,7 @@ push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (face
 
     cmd_base := w.frame * CMD_CAP
     data_base := w.frame * w.data_stride
-    data_index := w.chunk_count
+    data_index := w.visible_chunk_count
     offset := handle.offset
     for face in 0 ..< 6 {
         count := chunk.face_counts[face]
@@ -469,7 +469,7 @@ push_chunk_for_render :: proc(w : ^World, chunk : ^Chunk, cam : Camera) -> (face
     if faces_pushed == 0 do return 0
 
     w.data[data_base + data_index] = Per_Chunk_Data{chunk.pos.x * C_SIZE, chunk.pos.y * C_SIZE, chunk.pos.z * C_SIZE, 0}
-    w.chunk_count += 1
+    w.visible_chunk_count += 1
     return
 }
 

@@ -30,8 +30,6 @@ block_init :: proc() {
     atlas_builder_add(&atlas_builder, "../assets/blocks/log_top.png") // 7
     atlas_builder_add(&atlas_builder, "../assets/blocks/leaves.png") // 8
 
-
-
     g_block_atlas = atlas_builder_build("block_atlas", &atlas_builder)
 }
 
@@ -42,6 +40,29 @@ block_is_solid :: #force_inline proc(b : Block) -> bool {
 
 block_create_face :: #force_inline proc(b : Block, neighbour : Block) -> bool {
     return block_is_solid(b) && !block_is_solid(neighbour)
+}
+
+block_get_preview_atlas_index :: proc(block : Block) -> i32 {
+    assert(u8(block) < u8(BLOCK_COUNT))
+    switch block {
+    case Block.Stone:
+        return 0
+    case Block.Mantle:
+        return 1
+    case Block.Dirt:
+        return 2
+    case Block.Grass:
+        return 4
+    case Block.Sand:
+        return 5
+    case Block.Log:
+        return 7
+    case Block.Leaves:
+        return 8
+    case Block.Air:
+        return -1
+    }
+    return -1
 }
 
 block_get_atlas_index :: proc(b : Block, face : int) -> (index : u32, ok : bool) {

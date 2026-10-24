@@ -21,11 +21,11 @@ Camera :: struct {
     inv_proj :      m.mat4,
     view_proj :     m.mat4,
     frustum :       [6]vec4,
-    width, height : int, // window coords, matches glfw.GetCursorPos
+    width, height : i32, // window coords, matches glfw.GetCursorPos
     dirty :         bool,
 }
 
-camera_init :: proc(c : ^Camera, pos : vec3, width, height : int) {
+camera_init :: proc(c : ^Camera, pos : vec3, width, height : i32) {
     c^ = {}
     c.pos = pos
     c.orientation = 1
@@ -56,7 +56,7 @@ camera_tick :: proc(c : ^Camera) {
     c.dirty = false
 }
 
-camera_resize :: proc(c : ^Camera, width, height : int) {
+camera_resize :: proc(c : ^Camera, width, height : i32) {
     if width <= 0 || height <= 0 do return
     if width == c.width && height == c.height do return
     c.width = width
@@ -129,12 +129,12 @@ player_init :: proc(p : ^Player, pos : vec3, window : glfw.WindowHandle) {
     p.speed = 5.0
     p.window = window
     width, height := glfw.GetWindowSize(window)
-    camera_init(&p.camera, pos, int(width), int(height))
+    camera_init(&p.camera, pos, i32(width), i32(height))
 }
 
 player_tick :: proc(p : ^Player, world : ^World, delta_time : f32) {
     width, height := glfw.GetWindowSize(p.window)
-    camera_resize(&p.camera, int(width), int(height))
+    camera_resize(&p.camera, i32(width), i32(height))
 
     if update_input(p, delta_time) {
         p.camera.pos = p.pos
@@ -142,6 +142,10 @@ player_tick :: proc(p : ^Player, world : ^World, delta_time : f32) {
         p.camera.dirty = true
     }
     camera_tick(&p.camera)
+}
+
+player_resize_view :: proc(p : ^Player, width, height : i32) {
+    camera_resize(&p.camera, width, height)
 }
 
 player_orientation :: proc(p : Player) -> m.quat {

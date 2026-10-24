@@ -24,6 +24,11 @@ mouse_pressed : [MOUSE_BUTTON_COUNT]bool
 g_tracking_allocator : mem.Tracking_Allocator
 g_draw_lines : bool = true
 g_draw_text : bool = true
+g_selected_block : i32 = 0
+
+@(private = "file")
+@(rodata)
+g_available_blocks : []Block = {.Stone, .Mantle, .Dirt, .Grass, .Sand, .Log, .Leaves}
 
 main :: proc() {
     when ODIN_DEBUG {
@@ -62,6 +67,7 @@ main :: proc() {
     glfw.SwapInterval(0)
     glfw.SetMouseButtonCallback(window, input_mouse_button_callback)
     glfw.SetKeyCallback(window, input_key_callback)
+    glfw.SetFramebufferSizeCallback(window, glfw_framebuffer_size_callback)
 
     //opengl stuff
     gl.load_up_to(GL_VERSION_MAJOR, GL_VERSION_MINOR, glfw.gl_set_proc_address)
@@ -117,46 +123,48 @@ main :: proc() {
         player_tick(&g_player, &world, f32(dt))
         block_interaction(g_player, &world)
 
-        text_area(10, 10, 4, 16)
-        textln("voxels")
-        textln("%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
-        textln("--------------------------------")
-        textln("seed: %d", world.seed)
-        textln("load radius: %d", world.load_radius)
-        textln("frozen: %v", g_is_frozen)
+        ui_area(10, 10, 4, 16)
+        ui_textln("voxels")
+        ui_textln("%.0f fps | %.2f ms avg | %.2f ms worst", fps, avg_ms, fps_worst_dt * 1000)
+        ui_textln("--------------------------------")
+        ui_textln("seed: %d", world.seed)
+        ui_textln("load radius: %d", world.load_radius)
+        ui_textln("frozen: %v", g_is_frozen)
 
         pc := player_world_coord(g_player)
-        textln("player pos: %v", pc)
+        ui_textln("player pos: %v", pc)
 
         chunk_l, chunk_local_l := modiv_world_chunk_local(pc)
-        textln("chunk: %v | local: %v", chunk_l, chunk_local_l)
+        ui_textln("chunk: %v | local: %v", chunk_l, chunk_local_l)
 
         hunk_l, chunk_hunk_l := modiv_world_hunk_local(pc)
-        textln("hunk: %v | local: %v", hunk_l, chunk_hunk_l)
+        ui_textln("hunk: %v | local: %v", hunk_l, chunk_hunk_l)
 
-        textln("== active hunks ==")
+        ui_textln("== active hunks ==")
         for hunk_pos, hunk_ptr in world.hunks {
-            textln("\thunk pos: %v | cols count: %d", hunk_pos, hunk_ptr.cols_count)
+            ui_textln("\thunk pos: %v | cols count: %d", hunk_pos, hunk_ptr.cols_count)
         }
 
         biome, bok := world_get_biome(&world, pc.x, pc.z)
-        textln("biome: %v | ok: %v", biome, bok)
+        ui_textln("biome: %v | ok: %v", biome, bok)
 
-        textln("--------------------------------")
-        textln("m total allocated: %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_allocated, g_tracking_allocator.total_memory_allocated / 1024, g_tracking_allocator.total_memory_allocated / (1024 * 1024))
-        textln("m total freed:     %d (%d KB, %d MB)\n", g_tracking_allocator.total_memory_freed, g_tracking_allocator.total_memory_freed / 1024, g_tracking_allocator.total_memory_freed / (1024 * 1024))
-        textln("m peak allocated:  %d (%d KB, %d MB)\n", g_tracking_allocator.peak_memory_allocated, g_tracking_allocator.peak_memory_allocated / 1024, g_tracking_allocator.peak_memory_allocated / (1024 * 1024))
-        textln("--------------------------------")
+        ui_textln("--------------------------------")
+        ui_textln("m total allocated: %d (%d KB, %d MB)", g_tracking_allocator.total_memory_allocated, g_tracking_allocator.total_memory_allocated / 1024, g_tracking_allocator.total_memory_allocated / (1024 * 1024))
+        ui_textln("m total freed:     %d (%d KB, %d MB)", g_tracking_allocator.total_memory_freed, g_tracking_allocator.total_memory_freed / 1024, g_tracking_allocator.total_memory_freed / (1024 * 1024))
+        ui_textln("m peak allocated:  %d (%d KB, %d MB)", g_tracking_allocator.peak_memory_allocated, g_tracking_allocator.peak_memory_allocated / 1024, g_tracking_allocator.peak_memory_allocated / (1024 * 1024))
+        ui_textln("--------------------------------")
 
-        textln(
+        ui_textln(
             "vertex pool utilization: %d/%d [%.2f%%]",
             world.vertex_pool.page_count - world.vertex_pool.free_pages,
             world.vertex_pool.page_count,
             f32(world.vertex_pool.page_count - world.vertex_pool.free_pages) / f32(world.vertex_pool.page_count) * 100,
         )
 
+        selection_toolbar(g_player.camera.width, g_player.camera.height, g_selected_block, g_block_atlas)
+
         /*
-    // heightmap test
+        // heightmap test
         HEIGHTMAP_RADIUS :: 12
         for hz := -HEIGHTMAP_RADIUS; hz <= HEIGHTMAP_RADIUS; hz += 1 {
             for hx := -HEIGHTMAP_RADIUS; hx <= HEIGHTMAP_RADIUS; hx += 1 {
@@ -169,14 +177,13 @@ main :: proc() {
                 }
             }
         }
-*/
+        */
 
         cull_cam := g_is_frozen ? g_frozen_cam : g_player.camera
-
         if renderer_begin_frame(g_player.camera, cull_cam, f32(dt)) {
             face_count := world_render(&world, g_player.camera, cull_cam, draw_lines = true)
-            textln("face count: %d", face_count)
-            textln("chunk count: %d", world.chunk_count)
+            ui_textln("face count: %d", face_count)
+            ui_textln("chunk count: %d", world.visible_chunk_count)
 
             if g_is_frozen do iml_frustum(g_frozen_cam, 0xFF0000FF)
             if g_draw_lines {
@@ -192,25 +199,31 @@ main :: proc() {
     }
 }
 
-Text_Area :: struct {
-    x :    int,
-    y :    int,
-    pad :  int,
-    size : int,
-}
+selection_toolbar :: proc(width, height : i32, selected : i32, atlas : Atlas) {
 
-@(private = "file")
-text_area_inst : Text_Area = Text_Area{0, 0, 0, 16}
+    SLOT :: 72
+    PAD :: 6
+    SELECTED_OFFSET :: 16
+    SELECTED_SCALE :: 1.1
 
-@(private = "file")
-text_area :: #force_inline proc(x, y, padding : int, size : int = 16) {
-    text_area_inst = Text_Area{x, y, padding, size}
-}
+    n := i32(len(g_available_blocks))
+    bar_w := n * SLOT + (n + 1) * PAD
+    bar_h := i32(SLOT + 2 * PAD)
+    bar_x := (width - bar_w) / 2
 
-@(private = "file")
-textln :: #force_inline proc(fmt_str : string, args : ..any, color : u32 = WHITE) {
-    text(text_area_inst.x, text_area_inst.y, fmt_str, ..args, size = text_area_inst.size, color = color)
-    text_area_inst.y += text_area_inst.pad + text_area_inst.size
+    bot_padding := i32(32)
+    bar_y := height - bar_h - bot_padding
+
+    for block, i in g_available_blocks {
+        sx := f32(bar_x + PAD + i32(i) * (SLOT + PAD))
+        sy := f32(bar_y + PAD)
+        size := f32(SLOT)
+
+        if i32(i) == selected do sy -= SELECTED_OFFSET
+        index := block_get_preview_atlas_index(block)
+        if index < 0 do continue
+        ui_rect_atlas(f32(sx), f32(sy), size, size, atlas, u32(index))
+    }
 }
 
 @(private = "file")
@@ -223,23 +236,32 @@ block_interaction :: proc(p : Player, w : ^World) {
     hit : World_Hit
     if !world_trace(w, eye, dir, 20.0, &hit) do return
 
-    pos := vec3{f32(hit.pos.x) + 0.5, f32(hit.pos.y) + 0.5, f32(hit.pos.z) + 0.5}
-
-    if glfw.GetKey(p.window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS {
-        offp := hit.pos + hit.normal
-        iml_box(vec3{f32(offp.x) + 0.5, f32(offp.y) + 0.5, f32(offp.z) + 0.5}, vec3{1.0, 1.0, 1.0}, 0xFF0000FF)
-        if mouse_pressed[glfw.MOUSE_BUTTON_LEFT] {
-            world_set_block(w, offp, .Stone)
+    if mouse_pressed[glfw.MOUSE_BUTTON_MIDDLE] {
+        // why does this not run?
+        fmt.printf("hit.block: %v\n", hit.block)
+        for b, i in g_available_blocks {
+            if b == hit.block {
+                g_selected_block = i32(i)
+                break
+            }
         }
-    } else {
+    } else if glfw.GetKey(p.window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS {
+        pos := vec3{f32(hit.pos.x) + 0.5, f32(hit.pos.y) + 0.5, f32(hit.pos.z) + 0.5}
         iml_box(pos, vec3{1.0, 1.0, 1.0}, 0xFF0000FF)
+        iml_line(pos, pos + vec3{f32(hit.normal.x), f32(hit.normal.y), f32(hit.normal.z)}, 0xFF00FFFF)
+
         if mouse_pressed[glfw.MOUSE_BUTTON_LEFT] {
             world_set_block(w, hit.pos, .Air)
+        }
+    } else {
+        offp := hit.pos + hit.normal
+        iml_box(vec3{f32(offp.x) + 0.5, f32(offp.y) + 0.5, f32(offp.z) + 0.5}, vec3{1.0, 1.0, 1.0}, 0xFF0000FF)
+        if g_selected_block >= 0 && g_selected_block < i32(len(g_available_blocks)) && mouse_pressed[glfw.MOUSE_BUTTON_LEFT] {
+            world_set_block(w, offp, g_available_blocks[g_selected_block])
         }
     }
 
     iml_box(hit.world_pos, vec3{0.1, 0.1, 0.1}, 0xFF0000FF)
-    iml_line(pos, pos + vec3{f32(hit.normal.x), f32(hit.normal.y), f32(hit.normal.z)}, 0xFF00FFFF)
 }
 
 
@@ -260,6 +282,13 @@ gl_err_callback :: proc "c" (source : u32, type : u32, id : u32, severity : u32,
 }
 
 @(private = "file")
+glfw_framebuffer_size_callback :: proc "c" (window : glfw.WindowHandle, width, height : i32) {
+    context = runtime.default_context()
+    renderer_resize(width, height)
+    player_resize_view(&g_player, width, height)
+}
+
+@(private = "file")
 input_mouse_button_callback :: proc "c" (window : glfw.WindowHandle, button, action, mods : i32) {
     if button < 0 || int(button) >= MOUSE_BUTTON_COUNT do return
     if glfw.PRESS == action {
@@ -271,6 +300,13 @@ input_mouse_button_callback :: proc "c" (window : glfw.WindowHandle, button, act
 input_key_callback :: proc "c" (window : glfw.WindowHandle, key, scancode, action, mods : i32) {
     if key == glfw.KEY_ESCAPE && action == glfw.PRESS {
         glfw.SetWindowShouldClose(window, true)
+    }
+
+    // check 1-9 numbers
+    if action == glfw.PRESS {
+        if key >= glfw.KEY_1 && key <= glfw.KEY_9 {
+            g_selected_block = key - glfw.KEY_1
+        }
     }
 
     if (key == glfw.KEY_F1 && action == glfw.PRESS) {

@@ -4,7 +4,8 @@ struct Quad {
     vec4 pos_rect; // x0, y0, x1, y1
     vec4 uv_rect;  // u0, v0, u1, v1
     uint color;
-    uint _pad0[3];
+    uint layer; 
+    uint _pad0[2];
 };
 
 layout(std430, binding = 0) readonly buffer QuadBuffer {
@@ -15,6 +16,9 @@ uniform mat4 u_proj;
 
 out vec2 v_uv;
 out vec4 v_color;
+#ifdef SAMPLE_TEXARR
+out flat int v_layer;
+#endif
 
 vec4 unpack_u32(uint color) {
     float r = float((color >> 24) & 0xFFu) / 255.0;
@@ -39,5 +43,10 @@ void main() {
 
     gl_Position = u_proj * vec4(x, y, 0.0, 1.0);
     v_uv = vec2(u, v);
+
     v_color = unpack_u32(q.color);
+
+#ifdef SAMPLE_TEXARR
+    v_layer = int(q.layer); 
+#endif
 }

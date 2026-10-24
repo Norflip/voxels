@@ -12,11 +12,11 @@ import c "core:c/libc"
 @(private = "file")
 PROGRAM_LOG_SIZE :: 1024
 
-load_program :: proc(label : cstring, vspath, fspath : string) -> (u32, bool) {
-    vs_shader := load_shader(vspath, gl.VERTEX_SHADER, context.temp_allocator)
+load_program :: proc(label : cstring, vspath, fspath : string, defines : [][2]string = nil) -> (u32, bool) {
+    vs_shader := load_shader(vspath, gl.VERTEX_SHADER, defines, context.temp_allocator)
     defer gl.DeleteShader(vs_shader)
 
-    fs_shader := load_shader(fspath, gl.FRAGMENT_SHADER, context.temp_allocator)
+    fs_shader := load_shader(fspath, gl.FRAGMENT_SHADER, defines, context.temp_allocator)
     defer gl.DeleteShader(fs_shader)
 
     if vs_shader == gl.NONE || fs_shader == gl.NONE do return gl.NONE, false
@@ -41,8 +41,8 @@ load_program :: proc(label : cstring, vspath, fspath : string) -> (u32, bool) {
     return program, true
 }
 
-load_cs_program :: proc(label : cstring, path : string) -> (u32, bool) {
-    cs_shader := load_shader(path, gl.COMPUTE_SHADER, context.temp_allocator)
+load_cs_program :: proc(label : cstring, path : string, defines : [][2]string = nil) -> (u32, bool) {
+    cs_shader := load_shader(path, gl.COMPUTE_SHADER, defines, context.temp_allocator)
     defer gl.DeleteShader(cs_shader)
 
     if cs_shader == gl.NONE do return gl.NONE, false
@@ -67,7 +67,7 @@ load_cs_program :: proc(label : cstring, path : string) -> (u32, bool) {
 }
 
 @(private = "file")
-load_shader :: proc(path : string, type : u32, allocator : runtime.Allocator = context.allocator) -> u32 {
+load_shader :: proc(path : string, type : u32, defines : [][2]string, allocator : runtime.Allocator = context.allocator) -> u32 {
     src, ok := load_asset(path, allocator = allocator)
     defer free_asset(src, allocator = allocator)
     if !ok {
@@ -75,10 +75,34 @@ load_shader :: proc(path : string, type : u32, allocator : runtime.Allocator = c
         return gl.NONE
     }
 
+    define_block := build_define_block(defines, context.temp_allocator)
+    defer delete(define_block, context.temp_allocator)
+
+    version_end := 0
+    for i := 0; i < len(src); i += 1 {
+        if src[i] == '\n' {
+            version_end = i + 1
+            break
+        }
+    }
+    if version_end == 0 do version_end = len(src)
+
+    version_line := src[:version_end]
+    rest := src[version_end:]
+
+    parts := [3]string{string(version_line), string(define_block), string(rest)}
+    sources : [3]cstring
+    lengths : [3]i32
+    count : i32 = 0
+    for part in parts {
+        if len(part) == 0 do continue
+        sources[count] = cstring(raw_data(part))
+        lengths[count] = i32(len(part))
+        count += 1
+    }
+
     shader := gl.CreateShader(type)
-    ptr := transmute(cstring)raw_data(src)
-    length := i32(len(src))
-    gl.ShaderSource(shader, 1, &ptr, &length)
+    gl.ShaderSource(shader, count, &sources[0], &lengths[0])
     gl.CompileShader(shader)
 
     params : i32 = -1
@@ -94,6 +118,25 @@ load_shader :: proc(path : string, type : u32, allocator : runtime.Allocator = c
 
     return shader
 }
+
+@(private = "file")
+build_define_block :: proc(defines : [][2]string, allocator : runtime.Allocator) -> []u8 {
+    if defines == nil || len(defines) == 0 do return nil
+
+    b := strings.builder_make(allocator)
+    for def in defines {
+        key := def[0]
+        value := def[1]
+        if value == "" {
+            fmt.sbprintf(&b, "#define %s\n", key)
+        } else {
+            fmt.sbprintf(&b, "#define %s %s\n", key, value)
+        }
+    }
+    return b.buf[:]
+}
+
+
 
 // asset loading
 ASSET_PATH :: #config(ASSET_PATH, "")
